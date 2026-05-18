@@ -1,4 +1,26 @@
+# Ubuntu 24.04 LTS — VMware Template Guide
+
 *cloud-init · SSSD · Active Directory · Ubuntu 24.04 LTS*
+
+Anleitung zum Bauen eines Ubuntu-24.04-Templates in VMware vSphere mit
+cloud-init, SSH-Hardening, dynamischem MOTD, SSSD/Active-Directory-Anbindung
+und sauberem Versiegeln vor dem Konvertieren zum Template.
+
+## Helper-Scripts
+
+Im Repo liegen drei Scripts, die die manuellen Schritte aus den Parts unten
+automatisieren:
+
+| Script                | Phase                          | Zweck                                                                  |
+|-----------------------|--------------------------------|------------------------------------------------------------------------|
+| `prepare-template.sh` | Template-Vorbereitung          | Parts 1–6 (Pakete, cloud-init, SSH, MOTD, SSSD-Vorbereitung, Netplan)  |
+| `seal-template.sh`    | Vor dem Konvertieren           | Part 7 (Sysprep: cloud-init clean, Machine-ID, SSH-Keys, Logs …)       |
+| `post-clone.sh`       | Nach dem Klonen einer VM       | Part 8 (Domain Join, AD-Test, lokalen Sudo-User `vb-admin` anlegen)    |
+
+> **Hinweis:** Die Parts unten dokumentieren den manuellen Weg. Das Repo
+> bildet die Schritte 1:1 in den Scripts ab — wer die Scripts nutzt, kann
+> die Parts als Referenz für Konfigurationsdetails und Troubleshooting
+> verwenden.
 
 ---
 
@@ -586,6 +608,40 @@ sudo sssctl user-show john
 sudo tail -50 /var/log/sssd/sssd_int.vitabrevis.ch.log
 ```
 
+### Schritt 23 — Lokalen Sudo-User `vb-admin` anlegen (Break-Glass-Account)
+
+Nach erfolgreichem Domain Join wird auf jedem Klon ein zusätzlicher lokaler
+Sudo-User `vb-admin` angelegt. Er dient als **Break-Glass-Account** für den
+Fall, dass AD/SSSD nicht erreichbar ist (z.B. DC-Ausfall, Netzwerkproblem,
+Kerberos-Issue) — dann ist trotzdem ein lokaler Login mit Sudo-Rechten
+möglich.
+```bash
+# Interaktive Passwortabfrage durch adduser
+sudo adduser --gecos "VitaBrevis Admin" vb-admin
+
+# Sudo-Gruppe zuweisen
+sudo usermod -aG sudo vb-admin
+```
+
+> **Hinweis:** `adduser` fragt das Passwort interaktiv ab. Pro Klon ein
+> individuelles, starkes Passwort vergeben und sicher hinterlegen
+> (Passwortmanager / Vault). Der User bleibt persistent auf der VM —
+> im Gegensatz zu `localadmin`, dessen Default-Passwort vom Template stammt
+> und beim ersten Login geändert werden muss.
+
+Damit `vb-admin` auch via SSH einloggen kann, sollte die SSH-`AllowGroups`-Zeile
+(Part 3, Schritt 4) bereits den lokalen User enthalten — alternativ kann ein
+zusätzlicher User explizit erlaubt werden:
+```bash
+# Optional: vb-admin explizit für SSH erlauben
+sudo sed -i 's/^AllowGroups .*/& vb-admin/' /etc/ssh/sshd_config
+sudo systemctl restart sshd
+```
+
+> **Automatisierung:** Diese drei Schritte (Domain Join, AD-Test, vb-admin
+> anlegen) sind in `post-clone.sh` zusammengefasst. Aufruf nach dem Klonen:
+> `sudo ./post-clone.sh`.
+
 ### Troubleshooting
 
 | Symptom                          | Ursache                             | Lösung                                          |
@@ -595,6 +651,7 @@ sudo tail -50 /var/log/sssd/sssd_int.vitabrevis.ch.log
 | Hostname ist noch der alte       | Customization Spec nicht ausgewählt | Klon erneut mit Spec deployen                   |
 | IP-Adresse stimmt nicht          | DHCP überschreibt statische Config  | Fallback-Config Priorität prüfen (99 vs 50)     |
 | `localadmin` Login verweigert    | Passwort nicht gesetzt / User locked | User-Data in cloud-init Logs prüfen            |
+| `vb-admin` Login verweigert      | User nicht in `AllowGroups` / kein Sudo | `usermod -aG sudo vb-admin`, `AllowGroups` in sshd_config prüfen |
 | `id: user not found`            | SSSD läuft nicht / falsche Domain   | `systemctl restart sssd; realm list`            |
 | SSSD crashed: `krb5.keytab not found` | SSSD enabled vor Domain Join   | `systemctl disable sssd`, erst nach `realm join` aktivieren |
 | `Already joined` + keytab fehlt  | Veraltete Realm-Mitgliedschaft vom Template | `realm leave`, `rm /etc/krb5.keytab`, dann neu joinen |
