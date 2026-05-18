@@ -7,7 +7,7 @@
 #  Reihenfolge:
 #    1. Domain Join (SSSD aktivieren)
 #    2. AD-Authentifizierung testen
-#    3. Benutzer vb-admin entfernen
+#    3. Lokalen Sudo-User 'vb-admin' anlegen (Break-Glass-Account)
 #
 #  Verwendung: sudo ./post-clone.sh
 # ─────────────────────────────────────────────────────────────────
@@ -176,32 +176,41 @@ else
     echo "    ✘  Einige Tests fehlgeschlagen!"
     echo "    ════════════════════════════════════════════"
     echo ""
-    read -rp "  Trotzdem fortfahren und vb-admin entfernen? (ja/nein): " FORCE
+    read -rp "  Trotzdem fortfahren und vb-admin anlegen? (ja/nein): " FORCE
     if [[ "${FORCE,,}" != "ja" ]]; then
-        echo "  Abgebrochen. vb-admin bleibt erhalten."
+        echo "  Abgebrochen. Lokaler Sudo-User 'vb-admin' wurde NICHT angelegt."
         echo "  Troubleshooting: siehe vmware-template-guide.md Part 8"
         exit 1
     fi
 fi
 
 # ================================================================
-# Schritt 3 — Benutzer vb-admin entfernen
+# Schritt 3 — Lokalen Sudo-User 'vb-admin' anlegen
 # ================================================================
-log "Benutzer 'vb-admin' entfernen"
+log "Lokalen Sudo-User 'vb-admin' anlegen (Break-Glass-Account)"
 
 if id "vb-admin" &>/dev/null; then
-    # Aktive Prozesse des Users beenden
-    pkill -u vb-admin 2>/dev/null || true
-
-    # User + Home-Verzeichnis entfernen
-    deluser --remove-home vb-admin 2>/dev/null || userdel -r vb-admin 2>/dev/null || true
-
-    # Sicherstellen dass Home-Verzeichnis weg ist
-    rm -rf /home/vb-admin
-
-    echo "    Benutzer 'vb-admin' und Home-Verzeichnis entfernt."
+    echo "    User 'vb-admin' existiert bereits — Anlegen uebersprungen."
+    echo "    Sudo-Mitgliedschaft sicherstellen..."
+    usermod -aG sudo vb-admin
+    echo ""
+    read -rp "  Passwort fuer 'vb-admin' jetzt neu setzen? [j/N]: " RESET_PW
+    if [[ "${RESET_PW,,}" == "j" ]]; then
+        passwd vb-admin
+    fi
 else
-    echo "    Benutzer 'vb-admin' existiert nicht — uebersprungen."
+    echo "    Lege Benutzer 'vb-admin' an..."
+    echo "    (Passwort wird interaktiv abgefragt)"
+    echo ""
+    # adduser fragt das Passwort interaktiv ab; --gecos "" ueberspringt
+    # Vollname/Telefon-Fragen.
+    adduser --gecos "VitaBrevis Admin" vb-admin
+
+    echo ""
+    echo "    Sudo-Gruppe zuweisen..."
+    usermod -aG sudo vb-admin
+
+    echo "    Benutzer 'vb-admin' angelegt und in Gruppe 'sudo'."
 fi
 
 # ================================================================
@@ -213,5 +222,5 @@ echo "║  Post-Clone abgeschlossen!                              ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  ✔ Domain Join:  ${AD_DOMAIN}                           "
 echo "║  ✔ SSSD:         aktiv                                  ║"
-echo "║  ✔ vb-admin:     entfernt                               ║"
+echo "║  ✔ vb-admin:     angelegt (lokaler sudo Break-Glass)    ║"
 echo "╚══════════════════════════════════════════════════════════╝"
