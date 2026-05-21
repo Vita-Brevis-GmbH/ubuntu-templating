@@ -317,6 +317,7 @@ sudo vim /etc/sssd/sssd.conf
 domains = int.vitabrevis.ch
 config_file_version = 2
 services = nss, pam, sudo
+default_domain_suffix = int.vitabrevis.ch    # Login per Kurzname 'john' wird zu 'john@int.vitabrevis.ch'
 
 [domain/int.vitabrevis.ch]
 default_shell = /bin/bash
@@ -327,7 +328,7 @@ realmd_tags = manages-system joined-with-adcli
 id_provider = ad
 fallback_homedir = /home/%u@%d
 ad_domain = int.vitabrevis.ch
-use_fully_qualified_names = True        # Login als 'john@int.vitabrevis.ch'
+use_fully_qualified_names = True        # NSS liefert FQN: 'john@int.vitabrevis.ch'
 ldap_id_mapping = True
 access_provider = ad
 
