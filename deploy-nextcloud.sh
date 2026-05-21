@@ -294,12 +294,59 @@ log "MariaDB konfigurieren"
 # Sicherstellen dass MariaDB laeuft
 systemctl is-active --quiet mariadb || systemctl start mariadb
 
+# MariaDB-Tuning fuer Nextcloud (READ-COMMITTED, binlog ROW, InnoDB)
+MARIADB_TUNING="/etc/mysql/mariadb.conf.d/90-nextcloud.cnf"
+if [[ -f "${MARIADB_TUNING}" ]]; then
+    echo "    MariaDB-Tuning ${MARIADB_TUNING} existiert bereits — uebersprungen."
+else
+    echo "    Schreibe MariaDB-Tuning nach ${MARIADB_TUNING}..."
+    cat > "${MARIADB_TUNING}" <<'EOF'
+# Nextcloud MariaDB Tuning
+# Siehe: https://docs.nextcloud.com/server/latest/admin_manual/configuration_database/linux_database_configuration.html
+[mysqld]
+transaction_isolation     = READ-COMMITTED
+binlog_format             = ROW
+innodb_file_per_table     = 1
+innodb_buffer_pool_size   = 512M
+innodb_log_file_size      = 64M
+innodb_flush_log_at_trx_commit = 2
+innodb_flush_method       = O_DIRECT
+character-set-server      = utf8mb4
+collation-server          = utf8mb4_general_ci
+skip-character-set-client-handshake
+EOF
+    systemctl restart mariadb
+    echo "    MariaDB mit neuer Konfiguration neu gestartet."
+fi
+
 # Pruefen ob DB bereits existiert
 if mysql -u root -e "USE nextcloud" 2>/dev/null; then
-    echo "    Datenbank 'nextcloud' existiert bereits — uebersprungen."
+    echo "    Datenbank 'nextcloud' existiert bereits."
     echo ""
-    echo "  DB-Passwort fuer bestehende Datenbank eingeben:"
-    NC_DB_PASS=$(prompt_password "DB-Passwort fuer User 'nextcloud'")
+    echo "  DB-Passwort fuer bestehenden User 'nextcloud' eingeben"
+    echo "  (wird gegen die Datenbank verifiziert):"
+
+    # Bis zu 3 Versuche, das Passwort gegen die laufende DB zu verifizieren
+    DB_AUTH_OK=false
+    for attempt in 1 2 3; do
+        NC_DB_PASS=$(prompt_password "DB-Passwort fuer User 'nextcloud'")
+        if MYSQL_PWD="${NC_DB_PASS}" mysql -u nextcloud -h localhost \
+               -e "SELECT 1 FROM DUAL;" nextcloud &>/dev/null; then
+            echo "    Passwort verifiziert."
+            DB_AUTH_OK=true
+            break
+        else
+            echo "  Fehler: Passwort fuer 'nextcloud'@'localhost' ist falsch (Versuch ${attempt}/3)."
+        fi
+    done
+
+    if [[ "${DB_AUTH_OK}" != true ]]; then
+        echo ""
+        echo "  Passwort konnte nicht verifiziert werden. Abgebrochen."
+        echo "  Tipp: Passwort manuell setzen mit:"
+        echo "    sudo mysql -e \"ALTER USER 'nextcloud'@'localhost' IDENTIFIED BY '<neues-passwort>';\""
+        exit 1
+    fi
 else
     echo ""
     echo "  Nextcloud Datenbank-Passwort festlegen:"
@@ -352,13 +399,45 @@ echo "    Schritt 7 abgeschlossen."
 log "Apache konfigurieren"
 
 echo "    Apache-Module aktivieren..."
-a2enmod rewrite headers env dir mime ssl
+a2enmod rewrite headers env dir mime ssl socache_shmcb
 
-# Nextcloud vhost
-cat > /etc/apache2/sites-available/nextcloud.conf <<'EOF'
+# Selbstsigniertes Zertifikat erzeugen falls noch keines vorhanden
+# (Ubuntu liefert ssl-cert mit; das erzeugt /etc/ssl/{certs,private}/ssl-cert-snakeoil.*)
+SSL_CERT="/etc/ssl/certs/ssl-cert-snakeoil.pem"
+SSL_KEY="/etc/ssl/private/ssl-cert-snakeoil.key"
+
+if [[ ! -f "${SSL_CERT}" || ! -f "${SSL_KEY}" ]]; then
+    echo "    Selbstsigniertes Snake-Oil-Zertifikat erzeugen..."
+    apt-get install -y ssl-cert
+    make-ssl-cert generate-default-snakeoil --force-overwrite
+fi
+
+# Nextcloud vhost: Port 80 -> 301 Redirect auf 443
+cat > /etc/apache2/sites-available/nextcloud.conf <<EOF
 <VirtualHost *:80>
+    ServerName ${SERVER_NAME:-localhost}
+
+    # Alles auf HTTPS umlenken
+    RewriteEngine On
+    RewriteRule ^/?(.*)$ https://%{HTTP_HOST}/\$1 [R=301,L]
+
+    ErrorLog \${APACHE_LOG_DIR}/nextcloud-error.log
+    CustomLog \${APACHE_LOG_DIR}/nextcloud-access.log combined
+</VirtualHost>
+
+<VirtualHost *:443>
     DocumentRoot /var/www/nextcloud
-    ServerName localhost
+    ServerName ${SERVER_NAME:-localhost}
+
+    SSLEngine on
+    SSLCertificateFile      ${SSL_CERT}
+    SSLCertificateKeyFile   ${SSL_KEY}
+
+    # Moderne TLS-Konfiguration
+    SSLProtocol             all -SSLv3 -TLSv1 -TLSv1.1
+    SSLCipherSuite          ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+    SSLHonorCipherOrder     off
+    SSLSessionTickets       off
 
     <Directory /var/www/nextcloud/>
         Require all granted
@@ -370,14 +449,15 @@ cat > /etc/apache2/sites-available/nextcloud.conf <<'EOF'
         </IfModule>
     </Directory>
 
-    ErrorLog ${APACHE_LOG_DIR}/nextcloud-error.log
-    CustomLog ${APACHE_LOG_DIR}/nextcloud-access.log combined
+    ErrorLog \${APACHE_LOG_DIR}/nextcloud-ssl-error.log
+    CustomLog \${APACHE_LOG_DIR}/nextcloud-ssl-access.log combined
 </VirtualHost>
 EOF
 
-echo "    Vhost /etc/apache2/sites-available/nextcloud.conf erstellt."
+echo "    Vhost /etc/apache2/sites-available/nextcloud.conf erstellt (HTTP+HTTPS)."
 
 a2dissite 000-default.conf 2>/dev/null || true
+a2dissite default-ssl.conf 2>/dev/null || true
 a2ensite nextcloud.conf
 
 systemctl restart apache2
@@ -417,34 +497,57 @@ echo "    Apache mit neuer PHP-Konfiguration neu gestartet."
 # ================================================================
 log "Nextcloud Einrichtung via occ"
 
-echo ""
-echo "  Nextcloud Admin-Konto festlegen:"
-echo ""
-NC_ADMIN_USER=$(prompt_input "Admin-Benutzername" "admin")
-NC_ADMIN_PASS=$(prompt_password "Admin-Passwort")
-
-echo ""
-echo "    Nextcloud Installation starten..."
 cd /var/www/nextcloud
 
-# Passwoerter in temporaere Dateien schreiben (umgeht Shell-Sonderzeichen-Probleme)
-TMPDIR_PW=$(mktemp -d)
-printf '%s' "${NC_DB_PASS}" > "${TMPDIR_PW}/dbpass"
-printf '%s' "${NC_ADMIN_PASS}" > "${TMPDIR_PW}/adminpass"
-chmod 600 "${TMPDIR_PW}/dbpass" "${TMPDIR_PW}/adminpass"
+NC_CONFIG="/var/www/nextcloud/config/config.php"
 
-sudo -u www-data php occ maintenance:install \
-    --database      "mysql" \
-    --database-name  "nextcloud" \
-    --database-user  "nextcloud" \
-    --database-pass  "$(cat "${TMPDIR_PW}/dbpass")" \
-    --admin-user     "${NC_ADMIN_USER}" \
-    --admin-pass     "$(cat "${TMPDIR_PW}/adminpass")" \
-    --data-dir       "${NC_DATA}"
+if [[ -f "${NC_CONFIG}" ]] && sudo -u www-data php occ status 2>/dev/null | grep -q "installed: true"; then
+    echo "    Nextcloud ist bereits installiert (config.php vorhanden, occ status: installed)."
+    echo "    maintenance:install wird uebersprungen."
+    NC_ADMIN_USER=$(sudo -u www-data php occ user:list --output=json 2>/dev/null \
+        | grep -oE '"[^"]+"' | head -1 | tr -d '"' || echo "admin")
+else
+    if [[ -f "${NC_CONFIG}" ]]; then
+        echo "  WARNUNG: ${NC_CONFIG} existiert, aber 'occ status' meldet die Instanz"
+        echo "  nicht als installiert. Vermutlich abgebrochene Installation."
+        read -rp "  config.php verschieben (.bak) und neu installieren? (ja/nein): " RESET_NC
+        if [[ "${RESET_NC,,}" == "ja" ]]; then
+            mv "${NC_CONFIG}" "${NC_CONFIG}.bak.$(date +%s)"
+            echo "    Alte config.php weggesichert."
+        else
+            echo "  Abgebrochen. config.php manuell bereinigen und Script erneut starten."
+            exit 1
+        fi
+    fi
 
-rm -rf "${TMPDIR_PW}"
+    echo ""
+    echo "  Nextcloud Admin-Konto festlegen:"
+    echo ""
+    NC_ADMIN_USER=$(prompt_input "Admin-Benutzername" "admin")
+    NC_ADMIN_PASS=$(prompt_password "Admin-Passwort")
 
-echo "    Nextcloud Basisinstallation abgeschlossen."
+    echo ""
+    echo "    Nextcloud Installation starten..."
+
+    # Passwoerter in temporaere Dateien schreiben (umgeht Shell-Sonderzeichen-Probleme)
+    TMPDIR_PW=$(mktemp -d)
+    printf '%s' "${NC_DB_PASS}" > "${TMPDIR_PW}/dbpass"
+    printf '%s' "${NC_ADMIN_PASS}" > "${TMPDIR_PW}/adminpass"
+    chmod 600 "${TMPDIR_PW}/dbpass" "${TMPDIR_PW}/adminpass"
+
+    sudo -u www-data php occ maintenance:install \
+        --database      "mysql" \
+        --database-name  "nextcloud" \
+        --database-user  "nextcloud" \
+        --database-pass  "$(cat "${TMPDIR_PW}/dbpass")" \
+        --admin-user     "${NC_ADMIN_USER}" \
+        --admin-pass     "$(cat "${TMPDIR_PW}/adminpass")" \
+        --data-dir       "${NC_DATA}"
+
+    rm -rf "${TMPDIR_PW}"
+
+    echo "    Nextcloud Basisinstallation abgeschlossen."
+fi
 
 # Trusted Domains: localhost + Server-IP
 SERVER_IP=$(hostname -I | awk '{print $1}')
@@ -467,13 +570,14 @@ echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  Nextcloud Deployment abgeschlossen!                     ║"
 echo "╠══════════════════════════════════════════════════════════╣"
-printf "║  %-18s %-39s║\n" "URL:" "http://${SERVER_IP}"
+printf "║  %-18s %-39s║\n" "URL:" "https://${SERVER_IP}"
 printf "║  %-18s %-39s║\n" "Admin-User:" "${NC_ADMIN_USER}"
 printf "║  %-18s %-39s║\n" "Datenverzeichnis:" "${NC_DATA}"
 printf "║  %-18s %-39s║\n" "Datenbank:" "nextcloud@localhost (MariaDB)"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Naechste Schritte:                                      ║"
-echo "║  - HTTPS/SSL einrichten (Reverse Proxy oder Certbot)    ║"
+echo "║  - Snake-Oil-Zertifikat durch Let's Encrypt ersetzen    ║"
+echo "║    (certbot --apache) oder eigene CA einbinden          ║"
 echo "║  - Trusted Domains anpassen falls noetig                ║"
 echo "║  - Backup-Strategie einrichten                          ║"
 echo "╚══════════════════════════════════════════════════════════╝"
