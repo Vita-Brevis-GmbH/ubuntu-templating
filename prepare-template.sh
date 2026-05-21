@@ -328,6 +328,7 @@ cat > /etc/sssd/sssd.conf <<EOF
 domains = ${AD_DOMAIN}
 config_file_version = 2
 services = nss, pam, sudo
+default_domain_suffix = ${AD_DOMAIN}
 
 [domain/${AD_DOMAIN}]
 default_shell = /bin/bash
