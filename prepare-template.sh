@@ -10,7 +10,7 @@ set -euo pipefail
 
 # ── Hilfsfunktionen ────────────────────────────────────────────
 STEP=0
-TOTAL=6
+TOTAL=7
 
 log() {
     STEP=$((STEP + 1))
@@ -63,6 +63,15 @@ AD_ADMIN_GROUP=$(prompt_input "AD Admin-Gruppe (fuer sudo)" "G_server-admin")
 DEFAULT_USER=$(prompt_input "Default lokaler Admin-User" "localadmin")
 SERVER_DESCRIPTION=$(prompt_input "Server-Beschreibung" "Template - please set description")
 
+# SNMP Community (nur SNMPv2c, read-only) — verpflichtend
+SNMP_COMMUNITY=$(prompt_input "SNMPv2c Community (read-only)" "")
+if [[ -z "${SNMP_COMMUNITY}" ]]; then
+    echo "  Fehler: SNMP Community darf nicht leer sein."
+    exit 1
+fi
+SNMP_LOCATION=$(prompt_input "SNMP sysLocation" "Vita Brevis Datacenter")
+SNMP_CONTACT=$(prompt_input "SNMP sysContact" "it@vitabrevis.ch")
+
 # Zusammenfassung anzeigen
 echo ""
 echo "  ┌─────────────────────────────────────────────────────┐"
@@ -74,6 +83,9 @@ printf "  │  %-18s %-35s│\n" "KDC Secondary:" "${KDC_SECONDARY:-—}"
 printf "  │  %-18s %-35s│\n" "Admin-Gruppe:" "${AD_ADMIN_GROUP}"
 printf "  │  %-18s %-35s│\n" "Default User:" "${DEFAULT_USER}"
 printf "  │  %-18s %-35s│\n" "Beschreibung:" "${SERVER_DESCRIPTION}"
+printf "  │  %-18s %-35s│\n" "SNMP Community:" "${SNMP_COMMUNITY//?/*}"
+printf "  │  %-18s %-35s│\n" "SNMP Location:" "${SNMP_LOCATION}"
+printf "  │  %-18s %-35s│\n" "SNMP Contact:" "${SNMP_CONTACT}"
 echo "  └─────────────────────────────────────────────────────┘"
 echo ""
 read -rp "  Weiter mit diesen Einstellungen? [J/n]: " CONFIRM
@@ -384,6 +396,68 @@ echo "    systemd-networkd-wait-online deaktiviert und maskiert."
 echo "    Part 6 abgeschlossen."
 
 # ================================================================
+# Part 7 — SNMP Monitoring (SNMPv2c, read-only)
+# ================================================================
+log "SNMP Monitoring einrichten (snmpd, SNMPv2c read-only)"
+
+apt-get install -y snmpd snmp
+
+backup_file /etc/snmp/snmpd.conf
+
+# Ubuntu Default-Config nur auf 127.0.0.1 hoerend ersetzen.
+# Listen auf allen Interfaces (UDP/161); Zugriffsbeschraenkung via Community
+# und Netzwerk-Firewall/Routing — keine Source-IP-ACL in der snmpd.conf.
+cat > /etc/snmp/snmpd.conf <<EOF
+# ─────────────────────────────────────────────────────────────
+#  snmpd.conf — generiert von prepare-template.sh
+#  SNMPv2c, read-only. Community wird beim Templating gesetzt.
+# ─────────────────────────────────────────────────────────────
+
+# Listen auf allen Interfaces, UDP Port 161
+agentAddress udp:161
+
+# Systeminformationen
+sysLocation    ${SNMP_LOCATION}
+sysContact     ${SNMP_CONTACT}
+sysServices    72
+
+# Komplette MIB-2 + UCD freigeben (CPU, RAM, Disk, Interfaces)
+view   systemview  included   .1.3.6.1.2.1
+view   systemview  included   .1.3.6.1.4.1.2021
+view   systemview  included   .1.3.6.1.4.1.2021.11
+
+# Read-only Community (SNMPv2c) — Zugriff von ueberall, Filter via Firewall
+rocommunity ${SNMP_COMMUNITY} default -V systemview
+
+# Disk-Monitoring: alle Mountpoints, jeweils Schwellwert 10% frei
+includeAllDisks 10%
+
+# Load-Schwellwerte (1/5/15 min) — auslesbar via UCD-MIB
+load 12 10 5
+EOF
+chmod 600 /etc/snmp/snmpd.conf
+echo "    /etc/snmp/snmpd.conf geschrieben."
+
+# snmpd nicht via Default-Args /etc/default/snmpd auf 127.0.0.1 binden
+# lassen — agentAddress aus snmpd.conf gilt.
+if [[ -f /etc/default/snmpd ]]; then
+    sed -i 's|^SNMPDOPTS=.*|SNMPDOPTS="-Lsd -Lf /dev/null -u Debian-snmp -g Debian-snmp -I -smux mteTrigger mteTriggerConf -p /run/snmpd.pid"|' /etc/default/snmpd
+fi
+
+systemctl enable snmpd
+systemctl restart snmpd
+
+# Quick-Sanity-Check (lokal)
+sleep 1
+if snmpget -v 2c -c "${SNMP_COMMUNITY}" -t 2 -r 1 127.0.0.1 sysDescr.0 >/dev/null 2>&1; then
+    echo "    snmpd antwortet lokal — OK."
+else
+    echo "    Warnung: snmpd antwortet (noch) nicht — Status pruefen mit: systemctl status snmpd"
+fi
+
+echo "    Part 7 abgeschlossen."
+
+# ================================================================
 # Abschluss
 # ================================================================
 echo ""
@@ -392,7 +466,9 @@ echo "║  Template-Vorbereitung abgeschlossen!                   ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Naechste Schritte:                                     ║"
 echo "║  1. SSH Hardening manuell durchfuehren (falls gewuenscht)║"
-echo "║  2. seal-template.sh ausfuehren (Part 7/9)              ║"
-echo "║  3. VM herunterfahren: sudo shutdown -h now             ║"
-echo "║  4. In vCenter: Convert to Template                     ║"
+echo "║  2. SNMP-Erreichbarkeit vom Monitoring-Host testen:     ║"
+echo "║       snmpwalk -v 2c -c <community> <host> system       ║"
+echo "║  3. seal-template.sh ausfuehren                         ║"
+echo "║  4. VM herunterfahren: sudo shutdown -h now             ║"
+echo "║  5. In vCenter: Convert to Template                     ║"
 echo "╚══════════════════════════════════════════════════════════╝"

@@ -13,7 +13,7 @@ automatisieren:
 
 | Script                | Phase                          | Zweck                                                                  |
 |-----------------------|--------------------------------|------------------------------------------------------------------------|
-| `prepare-template.sh` | Template-Vorbereitung          | Parts 1–6 (Pakete, cloud-init, SSH, MOTD, SSSD-Vorbereitung, Netplan)  |
+| `prepare-template.sh` | Template-Vorbereitung          | Parts 1–6 + 6b (Pakete, cloud-init, SSH, MOTD, SSSD-Vorbereitung, Netplan, SNMP) |
 | `seal-template.sh`    | Vor dem Konvertieren           | Part 7 (Sysprep: cloud-init clean, Machine-ID, SSH-Keys, Logs …)       |
 | `post-clone.sh`       | Nach dem Klonen einer VM       | Part 8 (Domain Join, AD-Test, lokalen Sudo-User `vb-admin` anlegen)    |
 
@@ -416,6 +416,65 @@ sudo systemctl mask systemd-networkd-wait-online.service
 ```
 
 > **Hinweis:** Wenn cloud-init vom VMware-Datasource eine spezifischere Netzwerkkonfiguration erhält, überschreibt diese die Fallback-Config automatisch.
+
+---
+
+## Part 6b — SNMP Monitoring (SNMPv2c)
+
+Alle geklonten VMs sollen per SNMP überwacht werden. Die Community wird
+**einmalig beim Template-Bau** vergeben und ist damit auf allen Klonen
+identisch — Zugriffsbeschränkung erfolgt zusätzlich über Firewall/Routing
+auf den Monitoring-Host.
+
+### Schritt 12a — snmpd installieren
+```bash
+sudo apt install -y snmpd snmp
+```
+
+### Schritt 12b — /etc/snmp/snmpd.conf konfigurieren
+```bash
+sudo vim /etc/snmp/snmpd.conf
+```
+```ini
+# Listen auf allen Interfaces, UDP/161
+agentAddress udp:161
+
+sysLocation    Vita Brevis Datacenter
+sysContact     it@vitabrevis.ch
+sysServices    72
+
+# MIB-2 + UCD freigeben (CPU, RAM, Disk, Interfaces)
+view systemview included .1.3.6.1.2.1
+view systemview included .1.3.6.1.4.1.2021
+view systemview included .1.3.6.1.4.1.2021.11
+
+# Read-only Community (SNMPv2c)
+rocommunity <COMMUNITY> default -V systemview
+
+# Disk- und Load-Monitoring
+includeAllDisks 10%
+load 12 10 5
+```
+```bash
+sudo chmod 600 /etc/snmp/snmpd.conf
+sudo systemctl enable --now snmpd
+```
+
+> ⚠️ **Wichtig:** Die Community ist auf SNMPv2c ein **Shared Secret** —
+> nicht öffentlich machen, nicht `public` verwenden. Da SNMPv2c
+> unverschlüsselt überträgt, MUSS der Zugriff zusätzlich per Firewall auf
+> die Monitoring-Server beschränkt werden.
+
+### Schritt 12c — Erreichbarkeit testen
+Vom Monitoring-Host:
+```bash
+snmpwalk -v 2c -c <community> <host> system
+snmpget  -v 2c -c <community> <host> hrSystemUptime.0
+```
+
+> **Hinweis:** snmpd wird im Template aktiv gelassen — beim Klonen
+> startet der Service automatisch mit; `sysName` wird dynamisch aus
+> dem (durch cloud-init gesetzten) Hostname gelesen.
 
 ---
 
