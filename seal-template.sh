@@ -45,7 +45,6 @@ rm -f "/home/${LOCAL_ADMIN_USER}/.ssh/authorized_keys"
 echo "==> [7/12] '${LOCAL_ADMIN_USER}' Passwort auf Template-Default setzen..."
 # printf statt echo: keine Backslash-Interpretation, kein "-e"-Problem.
 printf '%s:%s\n' "$LOCAL_ADMIN_USER" "$LOCAL_ADMIN_PASSWORD" | chpasswd
-chage -d 0 "$LOCAL_ADMIN_USER"
 
 echo "==> [8/12] Domain-Mitgliedschaft entfernen (Klon muss neu joinen)..."
 realm leave 2>/dev/null || true
