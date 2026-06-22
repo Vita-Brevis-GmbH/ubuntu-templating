@@ -64,7 +64,7 @@ DEFAULT_USER=$(prompt_input "Default lokaler Admin-User" "localadmin")
 SERVER_DESCRIPTION=$(prompt_input "Server-Beschreibung" "Template - please set description")
 
 # SNMP Community (nur SNMPv2c, read-only) — verpflichtend
-SNMP_COMMUNITY=$(prompt_input "SNMPv2c Community (read-only)" "")
+SNMP_COMMUNITY=$(prompt_input "SNMPv2c Community (read-only)" "vb-rubigen")
 if [[ -z "${SNMP_COMMUNITY}" ]]; then
     echo "  Fehler: SNMP Community darf nicht leer sein."
     exit 1
