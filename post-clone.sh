@@ -15,7 +15,7 @@ set -euo pipefail
 
 # ── Hilfsfunktionen ────────────────────────────────────────────
 STEP=0
-TOTAL=3
+TOTAL=4
 
 log() {
     STEP=$((STEP + 1))
@@ -85,7 +85,45 @@ if [[ "${CONFIRM,,}" == "n" ]]; then
 fi
 
 # ================================================================
-# Schritt 1 — Domain Join & SSSD aktivieren
+# Schritt 1 — localadmin Passwort neu setzen
+# ================================================================
+log "localadmin Passwort neu setzen"
+
+echo "    Das Template-Default-Passwort fuer 'localadmin' wird jetzt ersetzt."
+echo "    Sonderzeichen sind erlaubt; eingegebene Zeichen werden nicht angezeigt."
+echo ""
+
+# IFS= verhindert, dass fuehrendes/abschliessendes Whitespace verschluckt wird.
+# -r verhindert, dass Backslashes als Escape-Sequenzen interpretiert werden.
+# -s unterdrueckt das Echo waehrend der Eingabe.
+while true; do
+    IFS= read -r -s -p "  Neues Passwort fuer 'localadmin': " NEW_PW
+    echo ""
+    if [[ -z "$NEW_PW" ]]; then
+        echo "    Passwort darf nicht leer sein. Bitte erneut."
+        continue
+    fi
+    IFS= read -r -s -p "  Passwort wiederholen: " NEW_PW_CONFIRM
+    echo ""
+    if [[ "$NEW_PW" != "$NEW_PW_CONFIRM" ]]; then
+        echo "    Passwoerter stimmen nicht ueberein. Bitte erneut."
+        continue
+    fi
+    break
+done
+
+# printf statt echo: keine Backslash-Interpretation, kein "-e"-Problem,
+# kein Sonderzeichen-Spuk durch die Shell. chpasswd trennt user:password
+# am ERSTEN ':' — Doppelpunkte im Passwort bleiben damit erhalten.
+printf '%s:%s\n' "localadmin" "$NEW_PW" | chpasswd
+# Ablauf-Flag entfernen — der User hat soeben ein gueltiges Passwort gesetzt.
+chage -d "$(date +%Y-%m-%d)" localadmin
+unset NEW_PW NEW_PW_CONFIRM
+
+echo "    Passwort fuer 'localadmin' gesetzt."
+
+# ================================================================
+# Schritt 2 — Domain Join & SSSD aktivieren
 # ================================================================
 log "Domain Join & SSSD aktivieren"
 
@@ -117,7 +155,7 @@ systemctl enable --now sssd
 echo "    Domain Join abgeschlossen."
 
 # ================================================================
-# Schritt 2 — AD-Authentifizierung testen
+# Schritt 3 — AD-Authentifizierung testen
 # ================================================================
 log "AD-Authentifizierung mit '${TEST_USER}' testen"
 
@@ -185,7 +223,7 @@ else
 fi
 
 # ================================================================
-# Schritt 3 — Lokalen Sudo-User 'vb-admin' anlegen
+# Schritt 4 — Lokalen Sudo-User 'vb-admin' anlegen
 # ================================================================
 log "Lokalen Sudo-User 'vb-admin' anlegen (Break-Glass-Account)"
 
