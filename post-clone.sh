@@ -5,9 +5,9 @@
 #  VMware Templates (Ubuntu 24.04 LTS).
 #
 #  Reihenfolge:
-#    1. Domain Join (SSSD aktivieren)
-#    2. AD-Authentifizierung testen
-#    3. Lokalen Sudo-User 'vb-admin' anlegen (Break-Glass-Account)
+#    1. localadmin Passwort neu setzen
+#    2. Domain Join (SSSD aktivieren)
+#    3. AD-Authentifizierung testen
 #
 #  Verwendung: sudo ./post-clone.sh
 # ─────────────────────────────────────────────────────────────────
@@ -15,7 +15,7 @@ set -euo pipefail
 
 # ── Hilfsfunktionen ────────────────────────────────────────────
 STEP=0
-TOTAL=4
+TOTAL=3
 
 log() {
     STEP=$((STEP + 1))
@@ -214,41 +214,12 @@ else
     echo "    ✘  Einige Tests fehlgeschlagen!"
     echo "    ════════════════════════════════════════════"
     echo ""
-    read -rp "  Trotzdem fortfahren und vb-admin anlegen? (ja/nein): " FORCE
+    read -rp "  Trotzdem fortfahren? (ja/nein): " FORCE
     if [[ "${FORCE,,}" != "ja" ]]; then
-        echo "  Abgebrochen. Lokaler Sudo-User 'vb-admin' wurde NICHT angelegt."
+        echo "  Abgebrochen."
         echo "  Troubleshooting: siehe vmware-template-guide.md Part 8"
         exit 1
     fi
-fi
-
-# ================================================================
-# Schritt 4 — Lokalen Sudo-User 'vb-admin' anlegen
-# ================================================================
-log "Lokalen Sudo-User 'vb-admin' anlegen (Break-Glass-Account)"
-
-if id "vb-admin" &>/dev/null; then
-    echo "    User 'vb-admin' existiert bereits — Anlegen uebersprungen."
-    echo "    Sudo-Mitgliedschaft sicherstellen..."
-    usermod -aG sudo vb-admin
-    echo ""
-    read -rp "  Passwort fuer 'vb-admin' jetzt neu setzen? [j/N]: " RESET_PW
-    if [[ "${RESET_PW,,}" == "j" ]]; then
-        passwd vb-admin
-    fi
-else
-    echo "    Lege Benutzer 'vb-admin' an..."
-    echo "    (Passwort wird interaktiv abgefragt)"
-    echo ""
-    # adduser fragt das Passwort interaktiv ab; --gecos "" ueberspringt
-    # Vollname/Telefon-Fragen.
-    adduser --gecos "VitaBrevis Admin" vb-admin
-
-    echo ""
-    echo "    Sudo-Gruppe zuweisen..."
-    usermod -aG sudo vb-admin
-
-    echo "    Benutzer 'vb-admin' angelegt und in Gruppe 'sudo'."
 fi
 
 # ================================================================
@@ -258,7 +229,7 @@ echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  Post-Clone abgeschlossen!                              ║"
 echo "╠══════════════════════════════════════════════════════════╣"
+echo "║  ✔ localadmin:   Passwort gesetzt                       ║"
 echo "║  ✔ Domain Join:  ${AD_DOMAIN}                           "
 echo "║  ✔ SSSD:         aktiv                                  ║"
-echo "║  ✔ vb-admin:     angelegt (lokaler sudo Break-Glass)    ║"
 echo "╚══════════════════════════════════════════════════════════╝"
