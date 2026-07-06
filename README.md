@@ -361,10 +361,13 @@ sudo visudo -f /etc/sudoers.d/ad-admins
 ```
 ```
 # Sudo für AD-Gruppe 'G_server-admin' erlauben
-%G_server-admin\@int.vitabrevis.ch ALL=(ALL) ALL
+# Gruppenname mit '@' in doppelte Anführungszeichen setzen — modernes
+# sudo (1.9.x, Ubuntu 24.04) lehnt den Backslash-Escape '\@' als
+# "illegal escape sequence" ab.
+"%G_server-admin@int.vitabrevis.ch" ALL=(ALL) ALL
 
 # Ohne Passwort (mit Bedacht verwenden)
-# %G_server-admin\@int.vitabrevis.ch ALL=(ALL) NOPASSWD: ALL
+# "%G_server-admin@int.vitabrevis.ch" ALL=(ALL) NOPASSWD: ALL
 ```
 
 ### Schritt 10b — SSSD & Domain-Mitgliedschaft auf dem Template bereinigen
@@ -719,7 +722,8 @@ sudo systemctl restart sshd
 | `realm join`: Insufficient permissions | Join-Account hat zu wenig Rechte | Delegation auf OU: Write All Properties auf Computer Objects |
 | `kinit`: KDC reply did not match | `[domain_realm]` fehlt oder falsch  | MIT-Defaults ersetzen, `dns_canonicalize_hostname = false` setzen |
 | Kerberos Auth schlägt fehl       | Clock Skew > 5 Minuten             | `sudo ntpdate -u <DC-IP>; timedatectl`          |
-| AD-User: not in sudoers file     | `@` in sudoers nicht escaped       | `%G_server-admin\@int.vitabrevis.ch` verwenden  |
+| AD-User: not in sudoers file     | Gruppenname mit `@` nicht gequotet | `"%G_server-admin@int.vitabrevis.ch"` (in Anführungszeichen) verwenden |
+| `visudo`: illegal escape sequence | `\@`-Escape von altem sudo entfernt | Backslash weg, Gruppenname stattdessen quoten: `"%grp@domain"` |
 | Sudoers-Änderung greift nicht    | SSSD cached Gruppenmitgliedschaft  | `rm -rf /var/lib/sss/db/*`, SSSD restart, neu einloggen |
 | Login verweigert                 | User nicht in erlaubter Gruppe      | `ad_access_filter` oder `AllowGroups` prüfen    |
 | Home-Verzeichnis fehlt           | pam_mkhomedir nicht aktiv           | `pam-auth-update --enable mkhomedir`            |
