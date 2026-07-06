@@ -8,7 +8,7 @@ und sauberem Versiegeln vor dem Konvertieren zum Template.
 
 ## Helper-Scripts
 
-Im Repo liegen drei Scripts, die die manuellen Schritte aus den Parts unten
+Im Repo liegen vier Scripts, die die manuellen Schritte aus den Parts unten
 automatisieren:
 
 | Script                | Phase                          | Zweck                                                                  |
@@ -16,6 +16,7 @@ automatisieren:
 | `prepare-template.sh` | Template-Vorbereitung          | Parts 1–6 + 6b (Pakete, cloud-init, SSH, MOTD, SSSD-Vorbereitung, Netplan, SNMP) |
 | `seal-template.sh`    | Vor dem Konvertieren           | Part 7 (Sysprep: cloud-init clean, Machine-ID, SSH-Keys, Logs …)       |
 | `post-clone.sh`       | Nach dem Klonen einer VM       | Part 8 (Domain Join, AD-Test, lokalen Sudo-User `vb-admin` anlegen)    |
+| `domain-join.sh`      | Standalone AD-Join             | Nur Domain Join: SSSD/Kerberos installieren + konfigurieren + joinen + testen — unabhängig von den Template-Scripts einsetzbar |
 
 > **Hinweis:** Die Parts unten dokumentieren den manuellen Weg. Das Repo
 > bildet die Schritte 1:1 in den Scripts ab — wer die Scripts nutzt, kann
