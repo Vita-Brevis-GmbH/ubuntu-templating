@@ -8,7 +8,7 @@ und sauberem Versiegeln vor dem Konvertieren zum Template.
 
 ## Helper-Scripts
 
-Im Repo liegen vier Scripts, die die manuellen Schritte aus den Parts unten
+Im Repo liegen mehrere Scripts, die die manuellen Schritte aus den Parts unten
 automatisieren:
 
 | Script                | Phase                          | Zweck                                                                  |
@@ -17,6 +17,8 @@ automatisieren:
 | `seal-template.sh`    | Vor dem Konvertieren           | Part 7 (Sysprep: cloud-init clean, Machine-ID, SSH-Keys, Logs …)       |
 | `post-clone.sh`       | Nach dem Klonen einer VM       | Part 8 (Domain Join, AD-Test, lokalen Sudo-User `vb-admin` anlegen)    |
 | `domain-join.sh`      | Standalone AD-Join             | Nur Domain Join: SSSD/Kerberos installieren + konfigurieren + joinen + testen — unabhängig von den Template-Scripts einsetzbar |
+| `deploy-nextcloud.sh` | Rollen-Deploy (Ubuntu 24.04)   | LVM `/data` + Apache + MariaDB + **PHP 8.3** + Nextcloud                |
+| `deploy-nextcloud-26.04.sh` | Rollen-Deploy (Ubuntu 26.04) | Wie oben, aber mit distro-nativem **PHP 8.5** (26.04 liefert kein php8.3) |
 
 > **Hinweis:** Die Parts unten dokumentieren den manuellen Weg. Das Repo
 > bildet die Schritte 1:1 in den Scripts ab — wer die Scripts nutzt, kann
