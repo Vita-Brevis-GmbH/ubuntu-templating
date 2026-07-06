@@ -259,11 +259,21 @@ log "Pakete installieren (Apache, MariaDB, PHP 8.3)"
 
 export DEBIAN_FRONTEND=noninteractive
 
+# PHP-Quelle: ondrej/php PPA
+# Ubuntus eigene Repos liefern die PECL-Extensions (imagick, apcu, redis)
+# nur unversioniert (php-imagick etc.); die versionierten Namen
+# 'php8.3-imagick/-apcu/-redis' stammen aus dem ondrej/php PPA. Das PPA
+# stellt zudem PHP 8.3 unabhaengig von Ubuntu-Basis/universe bereit und
+# haelt alle 'php8.3-*' Pakete konsistent.
 apt-get update
+apt-get install -y software-properties-common ca-certificates
+add-apt-repository -y ppa:ondrej/php
+apt-get update
+
 apt-get install -y \
     apache2 \
     mariadb-server \
-    libapache2-mod-php \
+    libapache2-mod-php8.3 \
     php8.3 \
     php8.3-gd \
     php8.3-mysql \
