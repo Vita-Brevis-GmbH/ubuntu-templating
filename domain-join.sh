@@ -189,7 +189,10 @@ echo "    /etc/sssd/sssd.conf geschrieben (chmod 600)."
 # Sudo fuer AD-Admin-Gruppe
 cat > /etc/sudoers.d/ad-admins <<EOF
 # Sudo fuer AD-Gruppe '${AD_ADMIN_GROUP}' erlauben
-%${AD_ADMIN_GROUP}\@${AD_DOMAIN} ALL=(ALL) ALL
+# Gruppenname in doppelte Anführungszeichen: modernes sudo (1.9.x) lehnt
+# den frueher ueblichen Backslash-Escape '\@' als "illegal escape sequence"
+# ab. Quoting deckt sowohl '@' als auch Leerzeichen im Gruppennamen ab.
+"%${AD_ADMIN_GROUP}@${AD_DOMAIN}" ALL=(ALL) ALL
 EOF
 chmod 440 /etc/sudoers.d/ad-admins
 visudo -c -f /etc/sudoers.d/ad-admins
