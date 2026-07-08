@@ -5,14 +5,38 @@
 #  Variante fuer Ubuntu 26.04 LTS (resolute) mit distro-nativem PHP 8.5.
 #  - LVM Disk Setup nach /data (wird uebersprungen wenn /data bereits gemountet)
 #  - Nextcloud Installation (Apache, MariaDB, PHP 8.5)
+#  - Optional: Self-signed SSL (-ssl)
 #
 #  Fuer Ubuntu 24.04 LTS (PHP 8.3) das Script deploy-nextcloud.sh nutzen.
 #  Nextcloud unterstuetzt PHP 8.3/8.4/8.5 — auf 26.04 ist 8.5 der Default
 #  und wird von Nextcloud empfohlen; ein PPA ist daher nicht noetig.
 #
-#  Verwendung: sudo ./deploy-nextcloud-26.04.sh
+#  Verwendung: sudo ./deploy-nextcloud-26.04.sh [-ssl]
+#    -ssl    Nextcloud mit self-signed SSL-Zertifikat einrichten.
+#            - Frische VM: nach der Installation wird zusaetzlich SSL aktiviert.
+#            - Bestehende HTTP-Installation: nur SSL-Migration
+#              (Cert erzeugen, Apache umbauen, overwriteprotocol=https).
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
+
+# ── Argumente parsen ───────────────────────────────────────────
+ENABLE_SSL=false
+for arg in "$@"; do
+    case "$arg" in
+        -ssl|--ssl)
+            ENABLE_SSL=true
+            ;;
+        -h|--help)
+            sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "Unbekanntes Argument: $arg"
+            echo "Verwendung: sudo $0 [-ssl]"
+            exit 1
+            ;;
+    esac
+done
 
 # PHP-Version dieser Ubuntu-Basis (26.04 = 8.5). Bei einer neueren Basis
 # hier anpassen (Nextcloud-unterstuetzte Version: 8.3, 8.4 oder 8.5).
@@ -55,6 +79,111 @@ prompt_password() {
     echo "${pass1}"
 }
 
+# ── SSL Setup (idempotent) ─────────────────────────────────────
+#  Erzeugt self-signed Cert (falls fehlend), schreibt Apache-Vhosts
+#  fuer :80 (Redirect) und :443 (SSL), setzt occ overwriteprotocol=https.
+setup_ssl() {
+    local ssl_dir="/etc/ssl/nextcloud"
+    local ssl_key="${ssl_dir}/nextcloud.key"
+    local ssl_crt="${ssl_dir}/nextcloud.crt"
+    local nc_root="/var/www/nextcloud"
+    local hostname_short hostname_fqdn ip_addr san
+
+    hostname_short=$(hostname)
+    hostname_fqdn=$(hostname -f 2>/dev/null || echo "$hostname_short")
+    ip_addr=$(hostname -I | awk '{print $1}')
+
+    if ! command -v openssl &>/dev/null; then
+        echo "    openssl fehlt — nachinstallieren..."
+        apt-get install -y openssl
+    fi
+
+    echo "    Self-signed Zertifikat vorbereiten (${ssl_dir})..."
+    install -d -m 750 "${ssl_dir}"
+
+    if [[ -f "${ssl_key}" && -f "${ssl_crt}" ]]; then
+        echo "    Zertifikat existiert bereits — Wiederverwendung."
+    else
+        san="DNS:${hostname_fqdn},DNS:${hostname_short},DNS:localhost,IP:${ip_addr},IP:127.0.0.1"
+        openssl req -x509 -nodes -newkey rsa:4096 \
+            -keyout "${ssl_key}" \
+            -out "${ssl_crt}" \
+            -days 3650 \
+            -subj "/CN=${hostname_fqdn}" \
+            -addext "subjectAltName=${san}" >/dev/null 2>&1
+        chmod 600 "${ssl_key}"
+        chmod 644 "${ssl_crt}"
+        echo "    Zertifikat erstellt (10 Jahre, SAN=${san})."
+    fi
+
+    echo "    Apache-Module ssl/headers/rewrite aktivieren..."
+    a2enmod ssl headers rewrite >/dev/null
+
+    echo "    Vhost /etc/apache2/sites-available/nextcloud-ssl.conf schreiben (Port 443)..."
+    cat > /etc/apache2/sites-available/nextcloud-ssl.conf <<EOF
+<VirtualHost *:443>
+    DocumentRoot ${nc_root}
+    ServerName ${hostname_fqdn}
+
+    SSLEngine on
+    SSLCertificateFile      ${ssl_crt}
+    SSLCertificateKeyFile   ${ssl_key}
+
+    <Directory ${nc_root}/>
+        Require all granted
+        AllowOverride All
+        Options FollowSymLinks MultiViews
+
+        <IfModule mod_dav.c>
+            Dav off
+        </IfModule>
+    </Directory>
+
+    <IfModule mod_headers.c>
+        Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains"
+    </IfModule>
+
+    ErrorLog \${APACHE_LOG_DIR}/nextcloud-ssl-error.log
+    CustomLog \${APACHE_LOG_DIR}/nextcloud-ssl-access.log combined
+</VirtualHost>
+EOF
+
+    echo "    Vhost /etc/apache2/sites-available/nextcloud.conf auf Redirect umbauen (Port 80)..."
+    cat > /etc/apache2/sites-available/nextcloud.conf <<EOF
+<VirtualHost *:80>
+    ServerName ${hostname_fqdn}
+    RewriteEngine On
+    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
+
+    ErrorLog \${APACHE_LOG_DIR}/nextcloud-error.log
+    CustomLog \${APACHE_LOG_DIR}/nextcloud-access.log combined
+</VirtualHost>
+EOF
+
+    a2ensite nextcloud.conf nextcloud-ssl.conf >/dev/null
+    a2dissite 000-default.conf 2>/dev/null || true
+    a2dissite default-ssl.conf 2>/dev/null || true
+
+    if [[ -f "${nc_root}/config/config.php" ]]; then
+        echo "    Nextcloud occ config anpassen (overwriteprotocol, trusted_domains)..."
+        sudo -u www-data php "${nc_root}/occ" config:system:set overwriteprotocol --value=https >/dev/null
+        sudo -u www-data php "${nc_root}/occ" config:system:set overwrite.cli.url --value="https://${hostname_fqdn}" >/dev/null
+        sudo -u www-data php "${nc_root}/occ" config:system:set trusted_domains 0 --value="localhost" >/dev/null
+        sudo -u www-data php "${nc_root}/occ" config:system:set trusted_domains 1 --value="${ip_addr}" >/dev/null
+        sudo -u www-data php "${nc_root}/occ" config:system:set trusted_domains 2 --value="${hostname_fqdn}" >/dev/null
+    fi
+
+    echo "    Apache Config testen..."
+    if apache2ctl configtest >/dev/null 2>&1; then
+        systemctl reload apache2 || systemctl restart apache2
+        echo "    Apache reloaded — SSL aktiv."
+    else
+        echo "    FEHLER: Apache configtest fehlgeschlagen. Pruefen mit: apache2ctl configtest"
+        apache2ctl configtest || true
+        return 1
+    fi
+}
+
 # ── Root-Check ──────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
     echo "Fehler: Dieses Script muss als root ausgefuehrt werden."
@@ -68,6 +197,34 @@ echo "║  Deploy: Nextcloud Server (Ubuntu 26.04)                 ║"
 echo "║  LVM + Apache + MariaDB + PHP 8.5 + Nextcloud           ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 
+# ── Frueher Ausstieg: bestehende Installation + -ssl → nur Migration ──
+if [[ "${ENABLE_SSL}" == true && -f /var/www/nextcloud/config/config.php ]]; then
+    echo ""
+    echo "  Bestehende Nextcloud-Installation erkannt (/var/www/nextcloud/config/config.php)."
+    echo "  Modus: SSL-Migration (self-signed) — keine Neu-Installation."
+    echo ""
+    read -rp "  Fortfahren? [J/n]: " CONFIRM
+    if [[ "${CONFIRM,,}" == "n" ]]; then
+        echo "  Abgebrochen."
+        exit 0
+    fi
+
+    echo ""
+    echo "========================================================"
+    echo "==> SSL-Migration"
+    echo "========================================================"
+    setup_ssl
+
+    IP_ADDR=$(hostname -I | awk '{print $1}')
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║  SSL-Migration abgeschlossen!                            ║"
+    printf "║  %-56s║\n" "URL: https://${IP_ADDR}"
+    echo "║  Hinweis: self-signed Cert — Browser-Warnung erwartet.   ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    exit 0
+fi
+
 # ── Pruefen ob /data bereits gemountet ist ─────────────────────
 SKIP_LVM=false
 MOUNT_POINT="/data"
@@ -80,6 +237,11 @@ if mountpoint -q "${MOUNT_POINT}" 2>/dev/null; then
     TOTAL=6
 else
     TOTAL=10
+fi
+
+# SSL zaehlt als zusaetzlicher Step am Ende.
+if [[ "${ENABLE_SSL}" == true ]]; then
+    TOTAL=$((TOTAL + 1))
 fi
 
 # ================================================================
@@ -492,19 +654,35 @@ sudo -u www-data php occ config:system:set default_phone_region --value="CH"
 echo "    Nextcloud konfiguriert."
 
 # ================================================================
+# Schritt 11 — SSL (self-signed) — nur wenn -ssl gesetzt
+# ================================================================
+if [[ "${ENABLE_SSL}" == true ]]; then
+    log "SSL einrichten (self-signed)"
+    setup_ssl
+fi
+
+# ================================================================
 # Abschluss
 # ================================================================
+if [[ "${ENABLE_SSL}" == true ]]; then
+    NC_URL="https://${SERVER_IP}"
+    NC_SSL_NOTE="- self-signed Cert (10 J.) — Browser-Warnung erwartet"
+else
+    NC_URL="http://${SERVER_IP}"
+    NC_SSL_NOTE="- HTTPS/SSL einrichten (mit -ssl oder Reverse Proxy)"
+fi
+
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  Nextcloud Deployment abgeschlossen!                     ║"
 echo "╠══════════════════════════════════════════════════════════╣"
-printf "║  %-18s %-39s║\n" "URL:" "http://${SERVER_IP}"
+printf "║  %-18s %-39s║\n" "URL:" "${NC_URL}"
 printf "║  %-18s %-39s║\n" "Admin-User:" "${NC_ADMIN_USER}"
 printf "║  %-18s %-39s║\n" "Datenverzeichnis:" "${NC_DATA}"
 printf "║  %-18s %-39s║\n" "Datenbank:" "nextcloud@localhost (MariaDB)"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Naechste Schritte:                                      ║"
-echo "║  - HTTPS/SSL einrichten (Reverse Proxy oder Certbot)    ║"
+printf "║  %-56s║\n" "${NC_SSL_NOTE}"
 echo "║  - Trusted Domains anpassen falls noetig                ║"
 echo "║  - Backup-Strategie einrichten                          ║"
 echo "╚══════════════════════════════════════════════════════════╝"
