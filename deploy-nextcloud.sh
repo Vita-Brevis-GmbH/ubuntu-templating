@@ -620,6 +620,9 @@ sudo -u www-data php occ config:system:set memcache.local --value="\\OC\\Memcach
 # Default-Telefon-Region
 sudo -u www-data php occ config:system:set default_phone_region --value="CH"
 
+# Skeleton-Verzeichnis leeren: neue Nutzer erhalten keine Beispieldateien
+sudo -u www-data php occ config:system:set skeletondirectory --value=""
+
 echo "    Nextcloud konfiguriert."
 
 # ================================================================
