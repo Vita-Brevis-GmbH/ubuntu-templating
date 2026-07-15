@@ -320,7 +320,10 @@ sudo vim /etc/sssd/sssd.conf
 domains = int.vitabrevis.ch
 config_file_version = 2
 services = nss, pam, sudo
-default_domain_suffix = int.vitabrevis.ch    # Login per Kurzname 'john' wird zu 'john@int.vitabrevis.ch'
+# Hinweis: KEIN 'default_domain_suffix' setzen — es ist laut SSSD-Doku
+# inkompatibel mit sudo und bricht das Matching gruppenbasierter
+# sudoers-Regeln (%G_server-admin@domain) sowie die Namensauflösung der
+# Primärgruppe ('groups: cannot find name for group ID ...').
 
 [domain/int.vitabrevis.ch]
 default_shell = /bin/bash
