@@ -166,7 +166,6 @@ cat > /etc/sssd/sssd.conf <<EOF
 domains = ${AD_DOMAIN}
 config_file_version = 2
 services = nss, pam, sudo
-default_domain_suffix = ${AD_DOMAIN}
 
 [domain/${AD_DOMAIN}]
 default_shell = /bin/bash
@@ -234,14 +233,13 @@ systemctl enable --now sssd
 
 # SSSD nach dem Schreiben unserer sssd.conf neu einlesen — realm join
 # hat die Datei ggf. ergaenzt/ueberschrieben; wir setzen sie hier bewusst
-# noch einmal, damit z.B. default_domain_suffix und use_fully_qualified_names
-# unseren Werten entsprechen.
+# noch einmal, damit z.B. use_fully_qualified_names unseren Werten
+# entsprechen.
 cat > /etc/sssd/sssd.conf <<EOF
 [sssd]
 domains = ${AD_DOMAIN}
 config_file_version = 2
 services = nss, pam, sudo
-default_domain_suffix = ${AD_DOMAIN}
 
 [domain/${AD_DOMAIN}]
 default_shell = /bin/bash
