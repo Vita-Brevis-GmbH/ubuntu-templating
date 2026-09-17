@@ -11,12 +11,14 @@ im README des Repos.
 Zeitbedarf beim ersten Mal: rund 90 Minuten. Bei einem Template-Update: rund
 20 Minuten.
 
-> **Ubuntu 26.04 statt 24.04.** Die Scripts laufen auf beiden Releases. In
-> 26.04 ist `sudo-rs` der Standard statt sudo 1.9, und die Basiswerkzeuge
-> kommen von uutils statt von GNU. Praktisch betrifft das nur eine Stelle:
-> Gruppennamen in `sudoers`-Dateien dürfen **nicht** in Anführungszeichen
-> stehen. Die Scripts schreiben das korrekt, wer von Hand nachträgt, muss es
-> wissen. Details im README unter Part 10.
+> **Ubuntu 26.04 statt 24.04.** Die Scripts laufen auf beiden Releases und
+> erkennen selbst, auf welchem sie sind. Für die Arbeit nach dieser Anleitung
+> ändert sich nichts. Eine Sache muss man aber wissen, wenn man später von
+> Hand an einer `sudoers`-Datei arbeitet: In 26.04 ist `sudo-rs` der Standard
+> statt sudo 1.9, und dessen Parser kennt **keine Anführungszeichen** um
+> Gruppennamen. Eine ungültige Datei in `/etc/sudoers.d` macht `sudo`
+> systemweit unbrauchbar. Die vollständige Liste der Unterschiede steht im
+> README unter Part 10.
 
 ---
 
@@ -156,6 +158,15 @@ Ubuntu Server 26.04.1 LTS, minimale Installation, kein Desktop.
 > Der temporäre Benutzer wird beim Versiegeln gelöscht. Er dient nur dazu,
 > die Scripts auszuführen. `localadmin` wird von den Scripts angelegt.
 
+> **`universe` muss aktiv sein.** Drei der benötigten Pakete liegen dort:
+> `oddjob`, `oddjob-mkhomedir` und `krb5-user`. Auf einer normalen
+> Server-Installation ist das der Fall. Nur wenn die VM aus einem minimalen
+> Image mit ausschliesslich `main` stammt, scheitert die Installation genau
+> an diesen dreien. Prüfen:
+> ```bash
+> apt-cache policy | grep -c universe    # → grösser als 0
+> ```
+
 ### 1.3 Hostnamen setzen
 
 Falls der Installer einen anderen Namen gesetzt hat:
@@ -186,7 +197,11 @@ cd ubuntu-templating
 sudo ./prepare-template.sh
 ```
 
-Das Script fragt der Reihe nach ab. Enter übernimmt den Wert in Klammern:
+Zuerst zeigt das Script das erkannte Ubuntu-Release im Kopf an. Ist es weder
+24.04 noch 26.04, fragt es einmal nach, bevor es weitermacht. Auf einem
+frisch installierten 26.04.1 kommt diese Rückfrage nicht.
+
+Danach fragt es der Reihe nach ab. Enter übernimmt den Wert in Klammern:
 
 | Nr. | Abfrage | Hinweis |
 |-----|---------|---------|
@@ -227,6 +242,20 @@ sudo VB_JOIN_PASSWORD='…' ./prepare-template.sh
 | 8 | SNMP (SNMPv2c, read-only) |
 | 9 | Firstboot-Automatik: Script, systemd-Unit, Konfiguration, Join-Secret |
 
+Drei Details, die man beim Nachlesen der erzeugten Dateien sonst für Fehler
+halten könnte:
+
+- Die Sudo-Regel in `/etc/sudoers.d/ad-admins` steht **ohne**
+  Anführungszeichen. Nur so parst sie unter sudo-rs. Leerzeichen im
+  Gruppennamen werden mit Backslash escaped.
+- Der Netplan-Fallback trägt `optional: true`. Ab netplan 1.2 wartet
+  `systemd-networkd-wait-online` sonst auf eine routbare Adresse **und** auf
+  DNS. Die Unit wird zusätzlich maskiert.
+- `ssh-host-keys.service` ordnet sich vor `ssh.service`, aber bewusst nicht
+  vor `ssh.socket`. Der Socket bindet nur den Port und braucht keine Host
+  Keys. Ubuntu macht es ab 26.04 in seinem eigenen `sshd-keygen.service`
+  genauso.
+
 ---
 
 ## Teil 3 — Kontrolle vor dem Versiegeln
@@ -247,16 +276,26 @@ ls /etc/krb5.keytab 2>/dev/null                  # → darf nicht existieren
 
 # SSH-Konfiguration gültig?
 sudo sshd -t && echo OK
+systemctl is-enabled ssh-host-keys.service       # → enabled
 
 # Sudo-Regel für die AD-Gruppe gültig? (auf 26.04 prüft das sudo-rs)
 sudo visudo -c -f /etc/sudoers.d/ad-admins
 cat /etc/sudoers.d/ad-admins      # Gruppenname ohne Anführungszeichen
 
-# Netzwerk-Fallback vorhanden?
-ls -l /etc/netplan/99-fallback-dhcp.yaml
+# Netzwerk-Fallback vorhanden und als optional markiert?
+sudo cat /etc/netplan/99-fallback-dhcp.yaml      # → optional: true
+systemctl is-enabled systemd-networkd-wait-online.service   # → masked
+sudo netplan generate && echo "netplan OK"
 
 # SNMP antwortet lokal?
 snmpget -v 2c -c <community> 127.0.0.1 .1.3.6.1.2.1.1.1.0
+```
+
+Auf Ubuntu 26.04 zusätzlich einmal nachsehen, wer `sudo` bedient:
+
+```bash
+update-alternatives --display sudo    # → sudo-rs gewinnt mit Priorität 50
+sudo --version
 ```
 
 Zusätzlich vom Monitoring-Host aus:
@@ -430,6 +469,19 @@ hostname -f
 
 Erwartet: Marker vorhanden, `realm list` zeigt die Domain, die Gruppe löst auf.
 
+Am aussagekräftigsten ist ein echter Login mit einem AD-Konto aus der
+Admin-Gruppe. Damit ist in einem Zug geprüft, dass SSSD auflöst, dass SSH die
+Gruppe durchlässt und dass die Sudo-Regel greift:
+
+```bash
+ssh <benutzer>@int.vitabrevis.ch@<neue-vm>
+sudo -l        # muss die Regel für die AD-Gruppe zeigen
+```
+
+> Zeigt `sudo -l` nichts oder meldet `not in the sudoers file`, liegt es fast
+> immer an `/etc/sudoers.d/ad-admins`. Auf 26.04 prüfen, ob der Gruppenname
+> dort ohne Anführungszeichen steht, und mit `visudo -c -f` validieren.
+
 ### 7.4 Wenn der Join fehlgeschlagen ist
 
 Der Marker wird nur nach einem erfolgreichen Lauf gesetzt. Fehlt er, versucht
@@ -456,6 +508,8 @@ sudo ./post-clone.sh --password
 
 ## Teil 8 — Template aktualisieren
 
+### 8.1 Patch-Update
+
 Alle paar Monate, damit neue VMs nicht mit hundert ausstehenden Updates starten.
 
 1. In vCenter: **Rechtsklick auf das Template → Convert to Virtual Machine**
@@ -478,11 +532,16 @@ Alle paar Monate, damit neue VMs nicht mit hundert ausstehenden Updates starten.
    sudo ./prepare-template.sh
    ```
 
-5. Versiegeln — hier werden Break-Glass-Passwort und Join-Secret neu gesetzt:
+5. Versiegeln. Hier wird das Break-Glass-Passwort neu vergeben:
 
    ```bash
    sudo ./seal-template.sh
    ```
+
+   > Das **Join-Secret** setzt `seal-template.sh` nicht. Es prüft nur, ob
+   > `/etc/vb-template/join.secret` vorhanden ist, und warnt sonst. Zum
+   > Rotieren entweder `prepare-template.sh` erneut laufen lassen oder die
+   > Datei direkt ersetzen, siehe [Anhang C](#anhang-c--secrets-und-rotation).
 
 6. Herunterfahren und zurück konvertieren:
 
@@ -491,6 +550,28 @@ Alle paar Monate, damit neue VMs nicht mit hundert ausstehenden Updates starten.
    ```
 
    Dann: **Rechtsklick auf die VM → Template → Convert to Template**
+
+### 8.2 Wechsel auf ein neues LTS
+
+Für den Sprung von einem LTS auf das nächste, etwa 24.04 auf 26.04, **kein**
+`do-release-upgrade` auf dem bestehenden Template. Stattdessen ein neues
+Template von Grund auf bauen, also [Teil 1](#teil-1--basis-vm-installieren)
+bis [Teil 5](#teil-5--zum-template-konvertieren) mit dem neuen ISO.
+
+Gründe:
+
+- Ein Release-Upgrade hinterlässt alte Konfigurationsdateien, abgelöste
+  Pakete und `.dpkg-dist`-Reste. Genau das soll ein Template nicht
+  weitergeben.
+- Beim Wechsel auf 26.04 ändern sich Dinge, die die Scripts frisch schreiben
+  müssen, allen voran die Sudo-Regel für die AD-Gruppe.
+- Das alte Template bleibt als Rückfallebene stehen, bis das neue verifiziert
+  ist.
+
+Das alte Template erst löschen, wenn mindestens ein Klon vom neuen
+vollständig durchgelaufen ist, inklusive Domain Join und Login mit einem
+AD-Konto. Die Customization Spec aus [Teil 6](#teil-6--customization-spec-anlegen)
+lässt sich unverändert weiterverwenden.
 
 ---
 
@@ -504,8 +585,14 @@ Alle paar Monate, damit neue VMs nicht mit hundert ausstehenden Updates starten.
 | `/etc/vb-template/join.secret` | `0600` | Passwort des Join-Accounts, ohne Zeilenumbruch |
 | `/var/lib/vb-template/firstboot.done` | `0644` | Marker, erst nach erfolgreichem Lauf |
 | `/var/log/vb-firstboot.log` | `0600` | Protokoll des Firstboot-Laufs |
-| `/etc/ssh/sshd_config.d/99-vita-brevis.conf` | `0644` | SSH-Hardening |
-| `/etc/netplan/99-fallback-dhcp.yaml` | `0600` | DHCP-Fallback |
+| `/etc/ssh/sshd_config.d/99-vita-brevis.conf` | `0644` | SSH-Hardening, `AllowGroups` |
+| `/etc/systemd/system/ssh-host-keys.service` | `0644` | Erzeugt fehlende Host Keys vor `sshd` |
+| `/etc/sudoers.d/ad-admins` | `0440` | Sudo für die AD-Gruppe, unquotiert |
+| `/etc/sssd/sssd.conf` | `0600` | SSSD, vom Firstboot nach dem Join neu geschrieben |
+| `/etc/krb5.conf` | `0644` | Realm und KDCs |
+| `/etc/netplan/99-fallback-dhcp.yaml` | `0600` | DHCP-Fallback, `optional: true` |
+| `/etc/cloud/cloud.cfg.d/99-vmware.cfg` | `0644` | VMware-Datasource |
+| `/etc/snmp/snmpd.conf` | `0600` | SNMPv2c, read-only |
 | `/etc/server-description` | `0644` | Text im MOTD |
 
 Ablauf des Firstboot-Laufs:
@@ -549,6 +636,10 @@ sudo journalctl -u vb-firstboot -n 50
 | SSH verweigert AD-Login | Gruppe fehlt in `AllowGroups` | `/etc/ssh/sshd_config.d/99-vita-brevis.conf` prüfen |
 | SNMP: `Unknown Object Identifier` | MIB-Dateien nicht installiert | Numerische OID verwenden |
 | Boot hängt bei networkd | `networkd-wait-online` nicht maskiert | Siehe Teil 2.3, Schritt 7 |
+| Boot hängt trotz Maskierung (26.04) | netplan 1.2 wartet auf routbare Adresse und DNS | `optional: true` im Netplan-Fallback ergänzen |
+| Log: „cloud-init nicht sauber abgeschlossen" | Exit-Code 2 bedeutet behebbarer Fehler, nicht Abbruch | `cloud-init status --long` ansehen, Firstboot läuft trotzdem weiter |
+| Erste SSH-Verbindung: `no host keys available` | Host Keys wurden nach dem Klonen nicht erzeugt | `systemctl status ssh-host-keys.service`, notfalls `ssh-keygen -A` |
+| `systemctl reload ssh` schlägt fehl | Bei Socket-Aktivierung ist `ssh.service` inaktiv | Nicht nötig, jede neue Verbindung liest die Konfiguration frisch |
 
 ---
 
@@ -598,6 +689,12 @@ sudo ./prepare-template.sh
 sudo ./seal-template.sh
 sudo shutdown -h now
 
+# Kontrolle vor dem Versiegeln
+systemctl is-enabled vb-firstboot.service
+systemctl is-enabled sssd                          # muss disabled sein
+sudo visudo -c -f /etc/sudoers.d/ad-admins
+sudo sshd -t && sudo netplan generate && echo OK
+
 # Auf einem Klon
 sudo ./post-clone.sh --status      # Zustand anzeigen
 sudo ./post-clone.sh               # Join nachholen, falls nötig
@@ -606,4 +703,11 @@ sudo ./post-clone.sh --password    # Break-Glass-Passwort ändern
 
 # Ohne Template-Automatik, beliebiges Ubuntu-System
 sudo ./domain-join.sh
+```
+
+Auf Ubuntu 26.04, wenn `sudo` sich unerwartet verhält:
+
+```bash
+update-alternatives --display sudo                 # wer bedient /usr/bin/sudo
+sudo update-alternatives --set sudo /usr/bin/sudo.ws   # zurück auf das Original
 ```
