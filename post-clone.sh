@@ -1,235 +1,215 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────
 #  post-clone.sh
-#  Allgemeine Post-Clone Aufgaben nach dem Klonen eines
-#  VMware Templates (Ubuntu 24.04 LTS).
 #
-#  Reihenfolge:
-#    1. localadmin Passwort neu setzen
-#    2. Domain Join (SSSD aktivieren)
-#    3. AD-Authentifizierung testen
+#  Im Normalfall wird dieses Script NICHT gebraucht: vb-firstboot.service
+#  erledigt Domain Join, SSSD und Server-Beschreibung beim ersten Boot
+#  eines Klons automatisch.
 #
-#  Verwendung: sudo ./post-clone.sh
+#  Hier geht es um die Ausnahmen:
+#    - nachsehen, ob der Firstboot durchgelaufen ist
+#    - einen fehlgeschlagenen oder uebersprungenen Join nachholen
+#    - eine VM neu joinen (z.B. nach Umbenennung)
+#    - das Break-Glass-Passwort auf diesem Klon aendern
+#
+#  Verwendung:
+#    sudo ./post-clone.sh              Status zeigen, Join bei Bedarf
+#    sudo ./post-clone.sh --status     Nur Status, nichts aendern
+#    sudo ./post-clone.sh --force      Join in jedem Fall wiederholen
+#    sudo ./post-clone.sh --password   Break-Glass-Passwort neu setzen
 # ─────────────────────────────────────────────────────────────────
-set -euo pipefail
+set -uo pipefail
 
-# ── Hilfsfunktionen ────────────────────────────────────────────
-STEP=0
-TOTAL=3
+FIRSTBOOT_BIN="/usr/local/sbin/vb-firstboot.sh"
+CONF_FILE="/etc/vb-template/firstboot.conf"
+SECRET_FILE="/etc/vb-template/join.secret"
+MARKER="/var/lib/vb-template/firstboot.done"
+LOG_FILE="/var/log/vb-firstboot.log"
 
-log() {
-    STEP=$((STEP + 1))
-    echo ""
-    echo "========================================================"
-    echo "==> [$STEP/$TOTAL] $1"
-    echo "========================================================"
+MODE="auto"          # auto | status | force
+DO_PASSWORD="no"
+
+usage() {
+    cat <<'EOF'
+post-clone.sh — Status & Reparatur nach dem Klonen
+
+Im Normalfall nicht noetig: vb-firstboot.service erledigt Domain Join,
+SSSD und Server-Beschreibung beim ersten Boot automatisch.
+
+  (ohne Optionen)  Status anzeigen und den Join nachholen, falls er
+                   fehlt oder fehlgeschlagen ist
+  --status         Nur Status anzeigen, nichts aendern
+  --force          Domain Join in jedem Fall wiederholen
+  --password       Break-Glass-Passwort auf diesem Klon neu setzen
+  --help           Diese Hilfe
+EOF
 }
 
-prompt_input() {
-    local prompt="$1"
-    local default="$2"
-    local value
-    read -rp "  ${prompt} [${default}]: " value
-    echo "${value:-$default}"
-}
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --status)   MODE="status" ;;
+        --force)    MODE="force" ;;
+        --password) DO_PASSWORD="yes" ;;
+        -h|--help)  usage; exit 0 ;;
+        *) echo "Unbekannte Option: $1" >&2; echo "Hilfe: $0 --help" >&2; exit 2 ;;
+    esac
+    shift
+done
 
 # ── Root-Check ──────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
-    echo "Fehler: Dieses Script muss als root ausgefuehrt werden."
-    echo "Verwendung: sudo $0"
+    echo "Fehler: Dieses Script muss als root ausgefuehrt werden." >&2
+    echo "Verwendung: sudo $0" >&2
     exit 1
+fi
+
+# ── Konfiguration einlesen (nur zur Anzeige) ────────────────────
+AD_DOMAIN=""
+AD_ADMIN_GROUP=""
+LOCAL_ADMIN_USER="localadmin"
+if [[ -r "$CONF_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF_FILE"
 fi
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  Post-Clone: Allgemeine Nachbereitung                   ║"
+echo "║  Post-Clone: Status & Reparatur                         ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 
-# ── Interaktive Abfrage ────────────────────────────────────────
+# ================================================================
+# Status
+# ================================================================
 echo ""
-echo "  Domain Join & AD-Konfiguration"
-echo ""
+echo "  System"
+printf "    %-22s %s\n" "Hostname:" "$(hostname -f 2>/dev/null || hostname)"
+printf "    %-22s %s\n" "Beschreibung:" "$(cat /etc/server-description 2>/dev/null || echo '—')"
+printf "    %-22s %s\n" "AD Domain (Config):" "${AD_DOMAIN:-— (keine Config gefunden)}"
 
-# Domain aus krb5.conf lesen falls vorhanden
-DEFAULT_DOMAIN="int.vitabrevis.ch"
-if [[ -f /etc/krb5.conf ]]; then
-    DETECTED_DOMAIN=$(grep -m1 "default_realm" /etc/krb5.conf 2>/dev/null | awk '{print $3}' | tr '[:upper:]' '[:lower:]')
-    [[ -n "$DETECTED_DOMAIN" ]] && DEFAULT_DOMAIN="$DETECTED_DOMAIN"
+echo ""
+echo "  Firstboot"
+if [[ -e "$MARKER" ]]; then
+    printf "    %-22s %s\n" "Marker:" "vorhanden"
+    sed 's/^/      /' "$MARKER"
+else
+    printf "    %-22s %s\n" "Marker:" "NICHT vorhanden — Firstboot lief nicht oder schlug fehl"
+fi
+if systemctl list-unit-files vb-firstboot.service &>/dev/null; then
+    printf "    %-22s %s\n" "Service:" "$(systemctl is-enabled vb-firstboot.service 2>/dev/null || echo unbekannt) / $(systemctl is-active vb-firstboot.service 2>/dev/null || echo inaktiv)"
 fi
 
-AD_DOMAIN=$(prompt_input "AD Domain (FQDN)" "${DEFAULT_DOMAIN}")
-AD_REALM=$(echo "${AD_DOMAIN}" | tr '[:lower:]' '[:upper:]')
-JOIN_USER=$(prompt_input "Join-User (AD-Konto fuer Domain Join)" "Administrator")
-TEST_USER=$(prompt_input "Test-User (AD-Konto zum Verifizieren)" "")
-
-# Test-User Validierung
-if [[ -z "${TEST_USER}" ]]; then
-    echo "  Fehler: Ein Test-User muss angegeben werden."
-    exit 1
+echo ""
+echo "  Active Directory"
+# Als gejoint gilt die VM, wenn eine Keytab existiert und SSSD laeuft.
+# Auf 'realm list' allein ist kein Verlass: beim adcli-Fallback kennt
+# realmd die Mitgliedschaft nicht.
+JOINED="nein"
+if [[ -s /etc/krb5.keytab ]] && systemctl is-active --quiet sssd; then
+    JOINED="ja"
+fi
+printf "    %-22s %s\n" "Domain Join:" "${JOINED}"
+printf "    %-22s %s\n" "Keytab:" "$( [[ -s /etc/krb5.keytab ]] && echo 'vorhanden' || echo 'fehlt' )"
+printf "    %-22s %s\n" "SSSD:" "$(systemctl is-active sssd 2>/dev/null || echo inaktiv)"
+printf "    %-22s %s\n" "realm list:" "$(realm list 2>/dev/null | head -1 || true)"
+if [[ -n "$AD_ADMIN_GROUP" && -n "$AD_DOMAIN" ]]; then
+    if getent group "${AD_ADMIN_GROUP}@${AD_DOMAIN}" >/dev/null 2>&1; then
+        printf "    %-22s %s\n" "Gruppen-Lookup:" "OK (${AD_ADMIN_GROUP}@${AD_DOMAIN})"
+    else
+        printf "    %-22s %s\n" "Gruppen-Lookup:" "fehlgeschlagen (${AD_ADMIN_GROUP}@${AD_DOMAIN})"
+        JOINED="nein"
+    fi
 fi
 
-# Zusammenfassung
-echo ""
-echo "  ┌─────────────────────────────────────────────────────┐"
-echo "  │  Konfiguration:                                     │"
-printf "  │  %-18s %-35s│\n" "AD Domain:" "${AD_DOMAIN}"
-printf "  │  %-18s %-35s│\n" "Kerberos Realm:" "${AD_REALM}"
-printf "  │  %-18s %-35s│\n" "Join-User:" "${JOIN_USER}"
-printf "  │  %-18s %-35s│\n" "Test-User:" "${TEST_USER}"
-echo "  └─────────────────────────────────────────────────────┘"
-echo ""
-read -rp "  Weiter mit diesen Einstellungen? [J/n]: " CONFIRM
-if [[ "${CONFIRM,,}" == "n" ]]; then
-    echo "  Abgebrochen."
+if [[ -f "$LOG_FILE" ]]; then
+    echo ""
+    echo "  Letzte Zeilen aus ${LOG_FILE}:"
+    tail -n 8 "$LOG_FILE" | sed 's/^/    /'
+fi
+
+# ================================================================
+# Break-Glass-Passwort
+# ================================================================
+if [[ "$DO_PASSWORD" == "yes" ]]; then
+    echo ""
+    echo "── Break-Glass-Passwort fuer '${LOCAL_ADMIN_USER}' neu setzen"
+    echo "   Sonderzeichen sind erlaubt; die Eingabe wird nicht angezeigt."
+    echo ""
+    while true; do
+        IFS= read -r -s -p "  Neues Passwort: " NEW_PW; echo ""
+        if [[ -z "$NEW_PW" ]]; then
+            echo "    Passwort darf nicht leer sein."
+            continue
+        fi
+        IFS= read -r -s -p "  Wiederholung:   " NEW_PW2; echo ""
+        if [[ "$NEW_PW" != "$NEW_PW2" ]]; then
+            echo "    Eingaben stimmen nicht ueberein."
+            continue
+        fi
+        break
+    done
+    # chpasswd trennt user:password am ERSTEN ':' — Doppelpunkte im
+    # Passwort bleiben damit erhalten.
+    printf '%s:%s\n' "$LOCAL_ADMIN_USER" "$NEW_PW" | chpasswd
+    unset NEW_PW NEW_PW2
+    echo "    Passwort fuer '${LOCAL_ADMIN_USER}' gesetzt."
+fi
+
+# ================================================================
+# Join nachholen / wiederholen
+# ================================================================
+if [[ "$MODE" == "status" ]]; then
+    echo ""
+    echo "  (--status: es wurde nichts veraendert)"
     exit 0
 fi
 
-# ================================================================
-# Schritt 1 — localadmin Passwort neu setzen
-# ================================================================
-log "localadmin Passwort neu setzen"
-
-echo "    Das Template-Default-Passwort fuer 'localadmin' wird jetzt ersetzt."
-echo "    Sonderzeichen sind erlaubt; eingegebene Zeichen werden nicht angezeigt."
-echo ""
-
-# IFS= verhindert, dass fuehrendes/abschliessendes Whitespace verschluckt wird.
-# -r verhindert, dass Backslashes als Escape-Sequenzen interpretiert werden.
-# -s unterdrueckt das Echo waehrend der Eingabe.
-while true; do
-    IFS= read -r -s -p "  Neues Passwort fuer 'localadmin': " NEW_PW
+if [[ "$MODE" == "auto" && "$JOINED" == "ja" && -e "$MARKER" ]]; then
     echo ""
-    if [[ -z "$NEW_PW" ]]; then
-        echo "    Passwort darf nicht leer sein. Bitte erneut."
-        continue
-    fi
-    IFS= read -r -s -p "  Passwort wiederholen: " NEW_PW_CONFIRM
+    echo "  Nichts zu tun — die VM ist gejoint und der Firstboot ist durchgelaufen."
+    echo "  Erneuten Join erzwingen: sudo $0 --force"
+    exit 0
+fi
+
+if [[ ! -x "$FIRSTBOOT_BIN" ]]; then
     echo ""
-    if [[ "$NEW_PW" != "$NEW_PW_CONFIRM" ]]; then
-        echo "    Passwoerter stimmen nicht ueberein. Bitte erneut."
-        continue
-    fi
-    break
-done
-
-# printf statt echo: keine Backslash-Interpretation, kein "-e"-Problem,
-# kein Sonderzeichen-Spuk durch die Shell. chpasswd trennt user:password
-# am ERSTEN ':' — Doppelpunkte im Passwort bleiben damit erhalten.
-printf '%s:%s\n' "localadmin" "$NEW_PW" | chpasswd
-# Ablauf-Flag entfernen — der User hat soeben ein gueltiges Passwort gesetzt.
-chage -d "$(date +%Y-%m-%d)" localadmin
-unset NEW_PW NEW_PW_CONFIRM
-
-echo "    Passwort fuer 'localadmin' gesetzt."
-
-# ================================================================
-# Schritt 2 — Domain Join & SSSD aktivieren
-# ================================================================
-log "Domain Join & SSSD aktivieren"
-
-echo "    Veraltete Domain-Mitgliedschaft bereinigen..."
-realm leave 2>/dev/null || true
-rm -f /etc/krb5.keytab
-
-echo "    Domain-Erreichbarkeit pruefen..."
-if ! realm discover "${AD_DOMAIN}" &>/dev/null; then
-    echo "    FEHLER: Domain '${AD_DOMAIN}' nicht erreichbar!"
-    echo "    DNS pruefen: nslookup _ldap._tcp.${AD_DOMAIN}"
+    echo "  FEHLER: ${FIRSTBOOT_BIN} nicht gefunden."
+    echo "  Dieses Template wurde ohne Firstboot-Automatik gebaut."
+    echo "  Fuer einen manuellen Join stattdessen './domain-join.sh' verwenden."
     exit 1
 fi
-echo "    Domain '${AD_DOMAIN}' erreichbar."
 
 echo ""
-echo "    Domain Join mit User '${JOIN_USER}'..."
-echo "    (Passwort-Eingabe wird von realm join abgefragt)"
-echo ""
-realm join --user="${JOIN_USER}" "${AD_DOMAIN}"
+echo "── Domain Join wird nachgeholt (${FIRSTBOOT_BIN} --force)"
 
-echo ""
-echo "    Mitgliedschaft pruefen..."
-realm list
-
-echo "    SSSD aktivieren & starten..."
-systemctl enable --now sssd
-
-echo "    Domain Join abgeschlossen."
-
-# ================================================================
-# Schritt 3 — AD-Authentifizierung testen
-# ================================================================
-log "AD-Authentifizierung mit '${TEST_USER}' testen"
-
-TEST_OK=true
-
-# Test 1: User-Lookup via SSSD
-echo "    [Test 1/3] User-Lookup: id ${TEST_USER}@${AD_DOMAIN}"
-if id "${TEST_USER}@${AD_DOMAIN}" &>/dev/null; then
-    id "${TEST_USER}@${AD_DOMAIN}"
-    echo "    ✔ User-Lookup erfolgreich."
-else
-    echo "    ✘ User '${TEST_USER}@${AD_DOMAIN}' nicht gefunden!"
-    echo "      Moeglicherweise braucht SSSD einen Moment..."
-    sleep 3
-    if id "${TEST_USER}@${AD_DOMAIN}" &>/dev/null; then
-        id "${TEST_USER}@${AD_DOMAIN}"
-        echo "    ✔ User-Lookup erfolgreich (nach Retry)."
-    else
-        echo "    ✘ User-Lookup fehlgeschlagen."
-        TEST_OK=false
-    fi
-fi
-
-# Test 2: Kerberos Ticket
-echo ""
-echo "    [Test 2/3] Kerberos: kinit ${TEST_USER}@${AD_REALM}"
-echo "    (Passwort des Test-Users eingeben)"
-echo ""
-if kinit "${TEST_USER}@${AD_REALM}"; then
-    echo "    ✔ Kerberos-Ticket erhalten."
-    klist
-    kdestroy
-else
-    echo "    ✘ Kerberos-Authentifizierung fehlgeschlagen."
-    TEST_OK=false
-fi
-
-# Test 3: SSSD Status
-echo ""
-echo "    [Test 3/3] SSSD Status..."
-if systemctl is-active --quiet sssd; then
-    echo "    ✔ SSSD laeuft."
-else
-    echo "    ✘ SSSD laeuft nicht!"
-    TEST_OK=false
-fi
-
-# Ergebnis auswerten
-echo ""
-if [[ "${TEST_OK}" == true ]]; then
-    echo "    ════════════════════════════════════════════"
-    echo "    ✔  Alle AD-Tests bestanden!"
-    echo "    ════════════════════════════════════════════"
-else
-    echo "    ════════════════════════════════════════════"
-    echo "    ✘  Einige Tests fehlgeschlagen!"
-    echo "    ════════════════════════════════════════════"
+# Auf einem erfolgreich gejointen Klon ist das Join-Secret bewusst
+# geloescht. Fuer einen erneuten Join muss es einmalig eingegeben werden.
+if [[ ! -s "$SECRET_FILE" && -z "${VB_JOIN_PASSWORD:-}" ]]; then
     echo ""
-    read -rp "  Trotzdem fortfahren? (ja/nein): " FORCE
-    if [[ "${FORCE,,}" != "ja" ]]; then
-        echo "  Abgebrochen."
-        echo "  Troubleshooting: siehe vmware-template-guide.md Part 8"
+    echo "   Das Join-Secret wurde auf diesem Klon nach dem ersten Join"
+    echo "   geloescht. Passwort des Join-Accounts '${JOIN_USER:-?}' eingeben:"
+    echo ""
+    IFS= read -r -s -p "  Passwort: " VB_JOIN_PASSWORD; echo ""
+    if [[ -z "$VB_JOIN_PASSWORD" ]]; then
+        echo "  Abgebrochen — kein Passwort eingegeben."
         exit 1
     fi
+    export VB_JOIN_PASSWORD
 fi
 
-# ================================================================
-# Abschluss
-# ================================================================
 echo ""
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  Post-Clone abgeschlossen!                              ║"
-echo "╠══════════════════════════════════════════════════════════╣"
-echo "║  ✔ localadmin:   Passwort gesetzt                       ║"
-echo "║  ✔ Domain Join:  ${AD_DOMAIN}                           "
-echo "║  ✔ SSSD:         aktiv                                  ║"
-echo "╚══════════════════════════════════════════════════════════╝"
+if "$FIRSTBOOT_BIN" --force; then
+    unset VB_JOIN_PASSWORD
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║  Post-Clone abgeschlossen.                              ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo "   AD-Login:    <user>@${AD_DOMAIN}"
+    echo "   Break-Glass: ${LOCAL_ADMIN_USER}"
+else
+    unset VB_JOIN_PASSWORD
+    echo ""
+    echo "  FEHLER: Firstboot-Lauf fehlgeschlagen."
+    echo "  Details: ${LOG_FILE}  bzw.  journalctl -u vb-firstboot -n 50"
+    echo "  Troubleshooting: siehe README.md"
+    exit 1
+fi

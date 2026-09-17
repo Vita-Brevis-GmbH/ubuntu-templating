@@ -1,0 +1,39 @@
+; ─────────────────────────────────────────────────────────────────
+;  vb-firstboot.service
+;  Fuehrt /usr/local/sbin/vb-firstboot.sh genau einmal aus — beim
+;  ersten Boot eines geklonten Templates.
+;
+;  Installation: /etc/systemd/system/vb-firstboot.service
+;  (wird von prepare-template.sh geschrieben und aktiviert)
+; ─────────────────────────────────────────────────────────────────
+[Unit]
+Description=Vita Brevis First Boot Configuration (AD Domain Join)
+Documentation=https://github.com/Vita-Brevis-GmbH/ubuntu-templating
+
+# Nach Netzwerk und cloud-init starten. cloud-final.service ist die
+# letzte cloud-init-Phase — danach stehen Hostname und IP fest.
+# Achtung: systemd-networkd-wait-online ist im Template maskiert,
+# network-online.target ist deshalb kein verlaessliches Signal. Das
+# Script wartet zusaetzlich selbst auf Default-Route und DNS.
+Wants=network-online.target
+After=network-online.target nss-lookup.target cloud-final.service
+
+# Selbstdeaktivierung: laeuft nicht mehr, sobald der Marker steht.
+ConditionPathExists=!/var/lib/vb-template/firstboot.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vb-firstboot.sh
+
+# Grosszuegiger als die Summe der internen Wartezeiten
+# (cloud-init 300s + Netzwerk/DC 300s + SSSD-Verifikation 60s).
+TimeoutStartSec=900
+
+# Ausgabe landet im Journal und auf der Konsole, damit ein
+# fehlgeschlagener Join auch ueber die vCenter-Konsole sichtbar ist.
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

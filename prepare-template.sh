@@ -8,9 +8,12 @@
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# Verzeichnis, in dem dieses Script (und firstboot.sh) liegt
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ── Hilfsfunktionen ────────────────────────────────────────────
 STEP=0
-TOTAL=7
+TOTAL=9
 
 log() {
     STEP=$((STEP + 1))
@@ -37,12 +40,40 @@ prompt_input() {
     echo "${value:-$default}"
 }
 
+# Passworteingabe ohne Echo, mit Wiederholung. Prompts und Meldungen
+# gehen nach stderr, damit nur das Passwort selbst auf stdout landet
+# und per $(...) uebernommen werden kann.
+prompt_secret() {
+    local prompt="$1"
+    local first second
+    while true; do
+        IFS= read -r -s -p "  ${prompt}: " first
+        echo "" >&2
+        IFS= read -r -s -p "  ${prompt} (Wiederholung): " second
+        echo "" >&2
+        if [[ "$first" == "$second" ]]; then
+            printf '%s' "$first"
+            return 0
+        fi
+        echo "    Eingaben stimmen nicht ueberein. Bitte erneut." >&2
+    done
+}
+
 # ── Root-Check ──────────────────────────────────────────────────
 if [[ $EUID -ne 0 ]]; then
     echo "Fehler: Dieses Script muss als root ausgefuehrt werden."
     echo "Verwendung: sudo $0"
     exit 1
 fi
+
+# ── Mitgelieferte Dateien pruefen ──────────────────────────────
+for _required in firstboot.sh vb-firstboot.service; do
+    if [[ ! -f "${SCRIPT_DIR}/${_required}" ]]; then
+        echo "Fehler: '${_required}' nicht gefunden in ${SCRIPT_DIR}."
+        echo "Bitte das komplette Repository auf die Template-VM klonen."
+        exit 1
+    fi
+done
 
 # ── Interaktive Konfiguration ──────────────────────────────────
 echo ""
@@ -62,6 +93,34 @@ KDC_SECONDARY=$(prompt_input "Sekundaerer KDC (FQDN, leer = keiner)" "dcs02-000-
 AD_ADMIN_GROUP=$(prompt_input "AD Admin-Gruppe (fuer sudo)" "G_server-admin")
 DEFAULT_USER=$(prompt_input "Default lokaler Admin-User" "localadmin")
 SERVER_DESCRIPTION=$(prompt_input "Server-Beschreibung" "Template - please set description")
+
+# ── Automatischer Domain Join beim ersten Boot ─────────────────
+echo ""
+echo "  Automatischer Domain Join (vb-firstboot)"
+echo "  Der hinterlegte Service-Account joint jeden Klon beim ersten"
+echo "  Boot selbsttaetig. Er braucht auf der Computer-OU nur das"
+echo "  Recht, Computerobjekte anzulegen und zurueckzusetzen."
+echo ""
+
+JOIN_USER=$(prompt_input "AD Join-Account" "svc-domainjoin")
+COMPUTER_OU=$(prompt_input "Computer-OU als DN (leer = Default-Container)" "")
+
+# Passwort: entweder aus der Umgebung (unbeaufsichtigter Build) oder
+# interaktiv. Leer = automatischer Join wird deaktiviert.
+JOIN_PASSWORD="${VB_JOIN_PASSWORD:-}"
+if [[ -z "${JOIN_PASSWORD}" ]]; then
+    JOIN_PASSWORD=$(prompt_secret "Passwort fuer '${JOIN_USER}' (leer = kein Auto-Join)")
+fi
+
+if [[ -n "${JOIN_PASSWORD}" ]]; then
+    ENABLE_JOIN="yes"
+else
+    ENABLE_JOIN="no"
+    echo ""
+    echo "  Hinweis: Kein Join-Passwort angegeben — der automatische"
+    echo "  Domain Join bleibt deaktiviert. Klone muessen dann manuell"
+    echo "  per 'post-clone.sh --force' oder 'domain-join.sh' joinen."
+fi
 
 # SNMP Community (nur SNMPv2c, read-only) — verpflichtend
 SNMP_COMMUNITY=$(prompt_input "SNMPv2c Community (read-only)" "vb-rubigen")
@@ -83,6 +142,9 @@ printf "  │  %-18s %-35s│\n" "KDC Secondary:" "${KDC_SECONDARY:-—}"
 printf "  │  %-18s %-35s│\n" "Admin-Gruppe:" "${AD_ADMIN_GROUP}"
 printf "  │  %-18s %-35s│\n" "Default User:" "${DEFAULT_USER}"
 printf "  │  %-18s %-35s│\n" "Beschreibung:" "${SERVER_DESCRIPTION}"
+printf "  │  %-18s %-35s│\n" "Auto-Join:" "${ENABLE_JOIN}"
+printf "  │  %-18s %-35s│\n" "Join-Account:" "${JOIN_USER}"
+printf "  │  %-18s %-35s│\n" "Computer-OU:" "${COMPUTER_OU:-— (Default)}"
 printf "  │  %-18s %-35s│\n" "SNMP Community:" "${SNMP_COMMUNITY//?/*}"
 printf "  │  %-18s %-35s│\n" "SNMP Location:" "${SNMP_LOCATION}"
 printf "  │  %-18s %-35s│\n" "SNMP Contact:" "${SNMP_CONTACT}"
@@ -148,6 +210,12 @@ backup_file /etc/cloud/cloud.cfg
 
 cat > /etc/cloud/cloud.cfg <<EOF
 # Managed by prepare-template.sh — nicht manuell bearbeiten
+#
+# Bewusst KEIN 'chpasswd'-Block: das Break-Glass-Passwort fuer
+# '${DEFAULT_USER}' wird ausschliesslich von seal-template.sh gesetzt.
+# Stuende es zusaetzlich hier, wuerde cloud-init es beim ersten Boot
+# jedes Klons wieder ueberschreiben — es gaebe zwei konkurrierende
+# Quellen fuer dasselbe Passwort.
 preserve_hostname: false
 
 system_info:
@@ -176,11 +244,6 @@ cloud_config_modules:
   - ssh
   - set_passwords
   - package_update_upgrade_install
-
-chpasswd:
-  list: |
-    ${DEFAULT_USER}:Change.Me.Now!
-  expire: true
 
 ssh_pwauth: true
 
@@ -221,6 +284,52 @@ systemctl enable ssh-host-keys.service
 
 echo "    ssh-host-keys.service aktiviert."
 echo "    Part 3 abgeschlossen."
+
+# ================================================================
+# Part 3b — SSH Hardening
+# ================================================================
+log "SSH Hardening konfigurieren"
+
+# Als Drop-in statt als Aenderung an sshd_config: Ubuntu 24.04 zieht
+# /etc/ssh/sshd_config.d/*.conf ganz oben ein, damit gewinnen unsere
+# Werte und ein Distributions-Update kann die Datei nicht ueberschreiben.
+cat > /etc/ssh/sshd_config.d/99-vita-brevis.conf <<EOF
+# Managed by prepare-template.sh — nicht manuell bearbeiten
+
+PermitRootLogin no
+PasswordAuthentication yes
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+
+# Kerberos/GSSAPI fuer Single-Sign-on nach dem Domain Join
+KerberosAuthentication yes
+GSSAPIAuthentication yes
+GSSAPICleanupCredentials yes
+
+X11Forwarding no
+AllowTcpForwarding no
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+# Zugang auf die AD-Admin-Gruppe und lokale Admins beschraenken.
+# 'sudo' deckt den Break-Glass-User ab und bleibt erreichbar, solange
+# die Domain nicht verfuegbar ist.
+AllowGroups sudo ${DEFAULT_USER} ${AD_ADMIN_GROUP}@${AD_DOMAIN}
+EOF
+chmod 644 /etc/ssh/sshd_config.d/99-vita-brevis.conf
+
+# Erst validieren, dann aktivieren — eine kaputte sshd_config wuerde
+# die laufende Session beim naechsten Reconnect aussperren.
+if sshd -t 2>/dev/null; then
+    systemctl reload ssh 2>/dev/null || systemctl restart ssh
+    echo "    /etc/ssh/sshd_config.d/99-vita-brevis.conf aktiv."
+else
+    rm -f /etc/ssh/sshd_config.d/99-vita-brevis.conf
+    echo "    WARNUNG: sshd-Konfiguration ungueltig — Drop-in wurde wieder entfernt."
+    sshd -t || true
+fi
+
+echo "    Part 3b abgeschlossen."
 
 # ================================================================
 # Part 4 — Login Banner (MOTD)
@@ -461,17 +570,108 @@ fi
 echo "    Part 7 abgeschlossen."
 
 # ================================================================
+# Part 8 — Firstboot-Automatik (Zero-Touch Domain Join)
+# ================================================================
+log "Firstboot-Automatik installieren (vb-firstboot)"
+
+install -m 0755 -o root -g root \
+    "${SCRIPT_DIR}/firstboot.sh" /usr/local/sbin/vb-firstboot.sh
+echo "    /usr/local/sbin/vb-firstboot.sh installiert."
+
+install -d -m 0700 -o root -g root /etc/vb-template
+install -d -m 0755 -o root -g root /var/lib/vb-template
+
+cat > /etc/vb-template/firstboot.conf <<EOF
+# ─────────────────────────────────────────────────────────────
+#  firstboot.conf — gelesen von /usr/local/sbin/vb-firstboot.sh
+#  Generiert von prepare-template.sh. Wird beim Klonen mitkopiert.
+# ─────────────────────────────────────────────────────────────
+
+# Active Directory
+AD_DOMAIN="${AD_DOMAIN}"
+AD_REALM="${AD_REALM}"
+AD_ADMIN_GROUP="${AD_ADMIN_GROUP}"
+
+# Service-Account fuer den unbeaufsichtigten Join. Das Passwort steht
+# in /etc/vb-template/join.secret und wird nach erfolgreichem Join auf
+# dem Klon vernichtet (WIPE_JOIN_SECRET).
+JOIN_USER="${JOIN_USER}"
+
+# Distinguished Name der Ziel-OU fuer Computerobjekte.
+# Leer = Standard-Container 'CN=Computers'.
+COMPUTER_OU="${COMPUTER_OU}"
+
+# Lokaler Break-Glass-User (nur fuer die Abschlussmeldung im Log)
+LOCAL_ADMIN_USER="${DEFAULT_USER}"
+
+# Wird von seal-template.sh gesetzt: Hostname zum Zeitpunkt des
+# Versiegelns. Stimmt der Hostname beim Boot noch damit ueberein,
+# wurde keine Customization Spec angewendet — dann wird NICHT gejoint.
+TEMPLATE_HOSTNAME=""
+
+# Automatischer Domain Join beim ersten Boot
+ENABLE_JOIN="${ENABLE_JOIN}"
+
+# Join-Secret nach erfolgreichem Join vom Klon loeschen
+WIPE_JOIN_SECRET="yes"
+
+# Timeouts in Sekunden
+WAIT_TIMEOUT="300"
+CLOUDINIT_TIMEOUT="300"
+EOF
+chmod 600 /etc/vb-template/firstboot.conf
+echo "    /etc/vb-template/firstboot.conf geschrieben (chmod 600)."
+
+if [[ -n "${JOIN_PASSWORD}" ]]; then
+    # Ohne Newline schreiben — der Wert wird 1:1 an realm/adcli gereicht.
+    ( umask 077; printf '%s' "${JOIN_PASSWORD}" > /etc/vb-template/join.secret )
+    chmod 600 /etc/vb-template/join.secret
+    chown root:root /etc/vb-template/join.secret
+    echo "    /etc/vb-template/join.secret geschrieben (chmod 600, nur root)."
+else
+    rm -f /etc/vb-template/join.secret
+    echo "    Kein Join-Secret hinterlegt — Auto-Join ist deaktiviert."
+fi
+unset JOIN_PASSWORD
+
+install -m 0644 -o root -g root \
+    "${SCRIPT_DIR}/vb-firstboot.service" /etc/systemd/system/vb-firstboot.service
+
+systemctl daemon-reload
+systemctl enable vb-firstboot.service
+# Marker entfernen, damit der Service auf jedem Klon wirklich laeuft.
+rm -f /var/lib/vb-template/firstboot.done
+echo "    vb-firstboot.service aktiviert."
+
+echo "    Part 8 abgeschlossen."
+
+# ================================================================
 # Abschluss
 # ================================================================
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  Template-Vorbereitung abgeschlossen!                   ║"
-echo "╠══════════════════════════════════════════════════════════╣"
-echo "║  Naechste Schritte:                                     ║"
-echo "║  1. SSH Hardening manuell durchfuehren (falls gewuenscht)║"
-echo "║  2. SNMP-Erreichbarkeit vom Monitoring-Host testen:     ║"
-echo "║       snmpwalk -v 2c -c <community> <host> system       ║"
-echo "║  3. seal-template.sh ausfuehren                         ║"
-echo "║  4. VM herunterfahren: sudo shutdown -h now             ║"
-echo "║  5. In vCenter: Convert to Template                     ║"
 echo "╚══════════════════════════════════════════════════════════╝"
+echo ""
+echo "  Eingerichtet:"
+echo "    - cloud-init (VMware Datasource), MOTD, SNMP, Netzwerk-Fallback"
+echo "    - SSH Hardening (/etc/ssh/sshd_config.d/99-vita-brevis.conf)"
+echo "    - SSSD/Kerberos vorkonfiguriert, Domain-Join noch offen"
+if [[ "${ENABLE_JOIN}" == "yes" ]]; then
+echo "    - vb-firstboot.service: joint jeden Klon beim ersten Boot"
+echo "      automatisch als '${JOIN_USER}' in '${AD_DOMAIN}'"
+else
+echo "    - vb-firstboot.service: installiert, Auto-Join DEAKTIVIERT"
+fi
+echo ""
+echo "  Naechste Schritte:"
+echo "    1. SNMP-Erreichbarkeit vom Monitoring-Host testen:"
+echo "         snmpwalk -v 2c -c <community> <host> system"
+echo "    2. Break-Glass-Passwort setzen und versiegeln:"
+echo "         sudo ./seal-template.sh"
+echo "    3. VM herunterfahren: sudo shutdown -h now"
+echo "    4. In vCenter: Convert to Template"
+echo ""
+echo "  Hinweis: '${DEFAULT_USER}' hat aktuell noch KEIN Passwort."
+echo "  Es wird von seal-template.sh vergeben — das ist die einzige"
+echo "  Stelle, an der das Break-Glass-Passwort gesetzt wird."

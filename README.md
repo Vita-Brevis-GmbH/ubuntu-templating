@@ -1,10 +1,31 @@
 # Ubuntu 24.04 LTS — VMware Template Guide
 
-*cloud-init · SSSD · Active Directory · Ubuntu 24.04 LTS*
+*cloud-init · SSSD · Active Directory · Zero-Touch Deployment · Ubuntu 24.04 LTS*
 
 Anleitung zum Bauen eines Ubuntu-24.04-Templates in VMware vSphere mit
 cloud-init, SSH-Hardening, dynamischem MOTD, SSSD/Active-Directory-Anbindung
 und sauberem Versiegeln vor dem Konvertieren zum Template.
+
+## Der Deployment-Ablauf in Kürze
+
+Seit die cloud-init User-Data beim Klonen in vCenter nicht mehr mitgegeben
+werden können, wird **nichts mehr von Hand nachkonfiguriert**. Alles, was
+pro VM unterschiedlich ist, kommt aus zwei Quellen:
+
+| Quelle                          | Liefert                                            |
+|---------------------------------|-----------------------------------------------------|
+| vCenter Guest OS Customization  | Hostname, IP-Adresse, Gateway, DNS                 |
+| `vb-firstboot.service` im Gast  | Domain Join, SSSD, Server-Beschreibung             |
+
+Der Ablauf besteht damit aus genau drei Handgriffen im vCenter:
+
+1. **Rechtsklick auf das Template → New VM from This Template**
+2. VM-Namen vergeben und die Customization Spec auswählen
+3. Einschalten — fertig
+
+Beim ersten Boot joint die VM selbsttätig die Domain und aktiviert SSSD.
+Danach meldet man sich mit dem AD-Konto an. Details in
+[Part 6c](#part-6c--zero-touch-firstboot-vb-firstboot).
 
 ## Helper-Scripts
 
@@ -13,9 +34,11 @@ automatisieren:
 
 | Script                | Phase                          | Zweck                                                                  |
 |-----------------------|--------------------------------|------------------------------------------------------------------------|
-| `prepare-template.sh` | Template-Vorbereitung          | Parts 1–6 + 6b (Pakete, cloud-init, SSH, MOTD, SSSD-Vorbereitung, Netplan, SNMP) |
-| `seal-template.sh`    | Vor dem Konvertieren           | Part 7 (Sysprep: cloud-init clean, Machine-ID, SSH-Keys, Logs …)       |
-| `post-clone.sh`       | Nach dem Klonen einer VM       | Part 8 (Domain Join, AD-Test, lokalen Sudo-User `vb-admin` anlegen)    |
+| `prepare-template.sh` | Template-Vorbereitung          | Parts 1–6c (Pakete, cloud-init, SSH-Hardening, MOTD, SSSD-Vorbereitung, Netplan, SNMP, Firstboot-Automatik) |
+| `firstboot.sh`        | Läuft **automatisch** im Klon  | Wird als `/usr/local/sbin/vb-firstboot.sh` installiert und beim ersten Boot von `vb-firstboot.service` ausgeführt: Domain Join, SSSD, Server-Beschreibung |
+| `vb-firstboot.service`| systemd-Unit dazu              | Oneshot beim ersten Boot, deaktiviert sich danach über einen Marker    |
+| `seal-template.sh`    | Vor dem Konvertieren           | Part 7 (Sysprep: cloud-init clean, Machine-ID, SSH-Keys, Logs, Break-Glass-Passwort, Firstboot scharf schalten) |
+| `post-clone.sh`       | Nur im Störungsfall            | Status anzeigen, fehlgeschlagenen Join nachholen, Break-Glass-Passwort ändern |
 | `domain-join.sh`      | Standalone AD-Join             | Nur Domain Join: SSSD/Kerberos installieren + konfigurieren + joinen + testen — unabhängig von den Template-Scripts einsetzbar |
 | `deploy-nextcloud.sh` | Rollen-Deploy (Ubuntu 24.04)   | LVM `/data` + Apache + MariaDB + **PHP 8.3** + Nextcloud                |
 | `deploy-nextcloud-26.04.sh` | Rollen-Deploy (Ubuntu 26.04) | Wie oben, aber mit distro-nativem **PHP 8.5** (26.04 liefert kein php8.3) |
@@ -45,9 +68,12 @@ sudo apt install -y \
 
 > **Hinweis:** `open-vm-tools` aktiviert die VMware Guest Customization — notwendig für automatisches Hostname-, IP- und Domain-Joining via vCenter.
 
-### Schritt 1b — Default-User `localadmin` anlegen
+### Schritt 1b — Break-Glass-User `localadmin` anlegen
 
-Dieser User dient als Standard-Administratorkonto auf allen geklonten VMs. Das Default-Passwort `Change.Me.Now!` wird in der cloud-init Config hinterlegt und muss beim ersten Login geändert werden.
+Dieser User ist das **Break-Glass-Konto**: der lokale Notzugang für den Fall,
+dass AD oder SSSD nicht erreichbar sind. Der reguläre Admin-Zugang läuft über
+Active Directory. Sein Passwort wird ausschliesslich von `seal-template.sh`
+vergeben — siehe Part 7.
 ```bash
 # User anlegen mit Home-Verzeichnis und Bash als Shell
 sudo adduser --disabled-password --gecos "Local Admin" localadmin
@@ -61,7 +87,10 @@ sudo chmod 700 /home/localadmin/.ssh
 sudo chown localadmin:localadmin /home/localadmin/.ssh
 ```
 
-> **Hinweis:** Kein Passwort manuell setzen — das Default-Passwort wird über die cloud-init Config in `/etc/cloud/cloud.cfg` vergeben. `seal-template.sh` setzt es vor dem Versiegeln zurück.
+> **Hinweis:** Kein Passwort manuell setzen. `seal-template.sh` fragt es beim
+> Versiegeln ab und ist die einzige Stelle, an der es vergeben wird. Zwischen
+> `prepare-template.sh` und `seal-template.sh` hat `localadmin` deshalb noch
+> kein Passwort — das ist beabsichtigt.
 
 ---
 
@@ -99,11 +128,6 @@ system_info:
     sudo: ["ALL=(ALL) NOPASSWD:ALL"]
     shell: /bin/bash
 
-chpasswd:
-  list: |
-    localadmin:Change.Me.Now!
-  expire: true
-
 ssh_pwauth: true
 
 cloud_init_modules:
@@ -133,15 +157,26 @@ cloud_final_modules:
   - final_message
 ```
 
-> **Hinweis:** Durch `system_info.default_user` weiss cloud-init, dass `localadmin` der Hauptbenutzer ist. Das Default-Passwort `Change.Me.Now!` wird beim ersten Login zwingend geändert (`expire: true`). `ssh_pwauth: true` erlaubt SSH-Login mit Passwort.
+> **Hinweis:** Durch `system_info.default_user` weiss cloud-init, dass `localadmin` der Hauptbenutzer ist. `ssh_pwauth: true` erlaubt SSH-Login mit Passwort.
+
+> ⚠️ **Bewusst kein `chpasswd`-Block:** Früher stand das Default-Passwort
+> zusätzlich hier. Das Ergebnis waren zwei konkurrierende Quellen für dasselbe
+> Passwort — cloud-init hat beim ersten Boot jedes Klons überschrieben, was
+> `seal-template.sh` vorher gesetzt hatte. Das Break-Glass-Passwort wird
+> ausschliesslich beim Versiegeln vergeben.
 
 ---
 
 ## Part 3 — SSH Hardening
 
-### Schritt 4 — sshd_config absichern
+### Schritt 4 — sshd absichern
+
+`prepare-template.sh` erledigt das automatisch. Statt `/etc/ssh/sshd_config`
+zu verändern, schreibt es ein Drop-in — Ubuntu 24.04 zieht
+`/etc/ssh/sshd_config.d/*.conf` ganz oben ein, damit gewinnen diese Werte
+und ein Distributions-Update kann sie nicht überschreiben.
 ```bash
-sudo vim /etc/ssh/sshd_config
+sudo vim /etc/ssh/sshd_config.d/99-vita-brevis.conf
 ```
 ```
 PermitRootLogin no
@@ -156,14 +191,20 @@ AllowTcpForwarding no
 ClientAliveInterval 300
 ClientAliveCountMax 2
 
-# Zugang auf AD-Gruppe einschränken
-AllowGroups G_server-admin@int.vitabrevis.ch localadmin
+# Zugang auf AD-Gruppe und lokale Admins einschränken
+AllowGroups sudo localadmin G_server-admin@int.vitabrevis.ch
 ```
 ```bash
-sudo systemctl restart sshd
+# Erst validieren, dann aktivieren — eine kaputte Config sperrt beim
+# nächsten Reconnect aus.
+sudo sshd -t && sudo systemctl reload ssh
 ```
 
-> **Hinweis:** `AllowGroups` enthält jetzt `localadmin` als lokalen User — damit ist SSH-Zugang vor dem AD-Join möglich.
+> **Hinweis:** `AllowGroups` enthält neben der AD-Gruppe auch `sudo` und
+> `localadmin`. Damit bleibt der Break-Glass-Zugang offen, solange die Domain
+> nicht erreichbar ist. Schlägt `sshd -t` fehl, entfernt
+> `prepare-template.sh` das Drop-in wieder, statt die laufende SSH-Sitzung zu
+> riskieren.
 
 ### Schritt 4b — SSH Host Keys vor sshd regenerieren
 
@@ -488,6 +529,120 @@ snmpget  -v 2c -c <community> <host> hrSystemUptime.0
 
 ---
 
+## Part 6c — Zero-Touch Firstboot (`vb-firstboot`)
+
+Das ist das Herzstück des Ablaufs. Ein systemd-Oneshot läuft beim **ersten
+Boot eines Klons**, joint die Domain und aktiviert SSSD. Danach setzt er einen
+Marker und läuft nie wieder.
+
+Der Dienst ersetzt den früheren manuellen Lauf von `post-clone.sh`. Weil er
+komplett im Gast liegt, funktioniert er unabhängig davon, was der Hypervisor
+an User-Data durchreicht — und bleibt damit auch nach der Migration auf
+Proxmox gültig.
+
+### Schritt 12d — AD vorbereiten: delegierter Join-Account
+
+Der Klon joint sich mit einem eigenen Service-Account. Der braucht **keine
+Domain-Admin-Rechte**. Auf der Ziel-OU für Computerobjekte genügt:
+
+| Recht                                   | Objekttyp        |
+|-----------------------------------------|------------------|
+| Create Computer Objects                 | OU               |
+| Delete Computer Objects                 | OU               |
+| Write All Properties                    | Computer Objects |
+| Reset Password                          | Computer Objects |
+
+In *Active Directory Users and Computers* → Rechtsklick auf die OU →
+**Delegate Control** → Service-Account wählen → *Create a custom task to
+delegate* → *Computer objects* mit *Create* und *Delete* → obige Rechte.
+
+> ⚠️ Den Account nicht für andere Zwecke wiederverwenden und bei jedem
+> Template-Rebuild rotieren. Sein Passwort liegt im Template.
+
+### Schritt 12e — Dateien im Template
+
+`prepare-template.sh` legt alles an. Zur Orientierung:
+
+| Pfad                                  | Rechte | Inhalt                                          |
+|---------------------------------------|--------|-------------------------------------------------|
+| `/usr/local/sbin/vb-firstboot.sh`     | `0755` | Das Script (aus `firstboot.sh` im Repo)         |
+| `/etc/systemd/system/vb-firstboot.service` | `0644` | Die systemd-Unit                           |
+| `/etc/vb-template/firstboot.conf`     | `0600` | Domain, Realm, Join-Account, OU, Timeouts       |
+| `/etc/vb-template/join.secret`        | `0600` | Passwort des Join-Accounts, ohne Zeilenumbruch  |
+| `/var/lib/vb-template/firstboot.done` | `0644` | Marker — erst nach erfolgreichem Lauf vorhanden |
+| `/var/log/vb-firstboot.log`           | `0600` | Protokoll des Laufs                             |
+
+### Schritt 12f — Was beim ersten Boot passiert
+
+| Schritt | Aktion                                                                 |
+|---------|------------------------------------------------------------------------|
+| 1       | `cloud-init status --wait` — Hostname und IP stehen erst danach fest     |
+| 2       | Hostname-Check gegen `TEMPLATE_HOSTNAME` (siehe unten)                  |
+| 3       | `/etc/server-description` setzen                                        |
+| 4       | Join-Passwort aus `join.secret` oder `$VB_JOIN_PASSWORD` lesen           |
+| 5       | Warten auf Default-Route, `realm discover` und Zeitsynchronisation       |
+| 6       | `realm leave`, Keytab löschen, dann `realm join` (Fallback: `adcli join`)|
+| 7       | `sssd.conf` auf die Template-Werte setzen, SSSD starten, Gruppe auflösen |
+| 8       | `join.secret` vernichten, Marker setzen                                 |
+
+### Der Hostname-Schutz
+
+`seal-template.sh` schreibt den Hostname des Templates in die Config. Stimmt
+der Hostname beim Boot noch damit überein, wurde **keine Customization Spec
+angewendet** — oder es handelt sich um die Wartungs-VM des Templates selbst.
+In beiden Fällen bricht der Dienst ab, statt ein Computerobjekt mit dem
+Template-Namen im AD anzulegen. Beim nächsten Boot versucht er es erneut.
+
+Das heisst auch: Wer das Template zum Aktualisieren wieder als VM startet,
+muss nichts weiter beachten. Die Wartungs-VM joint nicht.
+
+### Fehlerverhalten
+
+Der Marker wird **nur nach einem erfolgreichen Lauf** gesetzt. Schlägt der
+Join fehl, bleibt er aus und der Dienst versucht es beim nächsten Boot wieder.
+Das Join-Secret wird dabei nicht angetastet.
+
+```bash
+# Nachsehen, was passiert ist
+sudo cat /var/log/vb-firstboot.log
+sudo journalctl -u vb-firstboot -n 50
+
+# Sofort nachholen, ohne Reboot
+sudo ./post-clone.sh --force
+```
+
+### Optional: Werte pro VM über die vCenter-WebUI
+
+Auch ohne cloud-init User-Data lassen sich einzelne Werte pro VM mitgeben —
+über *VM bearbeiten → VM Options → Advanced → Configuration Parameters →
+Add*. Das Script liest sie mit `vmware-rpctool` aus. Beides ist optional.
+
+| Parameter                   | Wirkung                                                  |
+|-----------------------------|----------------------------------------------------------|
+| `guestinfo.vb.description`  | Setzt `/etc/server-description` (erscheint im MOTD)      |
+| `guestinfo.vb.join`         | `no` überspringt den Domain Join auf dieser VM           |
+
+> **Hinweis:** Der Klon-Assistent kennt diese Felder nicht. Wer sie nutzen
+> will, klont ohne Einschalten, trägt die Parameter nach und schaltet dann
+> ein. Für den Normalfall braucht es das nicht.
+
+### Sicherheitsabwägung
+
+Das Passwort des Join-Accounts liegt als root-lesbare Datei im Template.
+Wer root auf einem frisch geklonten, noch nicht gejointen System hat, kann es
+lesen. Abgefedert wird das so:
+
+- Der Account darf **nur** Computerobjekte in einer OU verwalten.
+- Nach erfolgreichem Join wird `join.secret` auf dem Klon mit `shred`
+  vernichtet. Es existiert dann nur noch im Template.
+- Das Passwort wird bei jedem Template-Rebuild rotiert.
+
+Wer das nicht will, setzt beim Bau kein Passwort. Dann bleibt der Auto-Join
+deaktiviert und die Klone werden mit `post-clone.sh --force` oder
+`domain-join.sh` von Hand gejoint.
+
+---
+
 ## Part 7 — Template versiegeln (Sysprep-Äquivalent)
 
 Das ist der eigentliche Sysprep-Schritt — alle instanzspezifischen Daten werden entfernt, damit jeder Clone mit einer sauberen Identität startet.
@@ -534,12 +689,45 @@ sudo journalctl --vacuum-time=1s
 sudo find /var/log -type f -exec truncate -s 0 {} \;
 ```
 
+### Schritt 16b — Break-Glass-Passwort vergeben
+
+Das Passwort für `localadmin` wird hier vergeben und nirgends sonst. Es steht
+bewusst **nicht** im Repository: ein Passwort im Git-Verlauf gilt auf jedem
+Klon und lässt sich nicht zurückziehen.
+```bash
+# Interaktiv (fragt zweimal ab, ohne Echo)
+sudo ./seal-template.sh
+
+# Oder unbeaufsichtigt
+sudo VB_LOCAL_ADMIN_PASSWORD='…' ./seal-template.sh
+```
+
+> ⚠️ Das Passwort gilt auf allen Klonen dieses Templates. Sicher hinterlegen
+> und bei jedem Template-Rebuild rotieren.
+
+### Schritt 16c — Firstboot scharf schalten
+
+`seal-template.sh` erledigt das mit. Zur Kontrolle:
+```bash
+# Template-Hostname festhalten — Grundlage für den Hostname-Schutz
+grep TEMPLATE_HOSTNAME /etc/vb-template/firstboot.conf
+
+# Marker muss WEG sein, sonst überspringt der Klon den Join
+ls /var/lib/vb-template/firstboot.done      # darf nicht existieren
+
+# Service muss aktiviert sein
+systemctl is-enabled vb-firstboot.service   # → enabled
+
+# Join-Secret muss vorhanden sein
+sudo ls -l /etc/vb-template/join.secret     # → -rw------- root root
+```
+
 ### Schritt 17 — Herunterfahren & Template erstellen
 ```bash
 sudo shutdown -h now
 ```
 
-> ⚠️ **Nur herunterfahren — NICHT neu starten!** Ein Reboot generiert Machine-ID und SSH-Keys sofort neu.
+> ⚠️ **Nur herunterfahren — NICHT neu starten!** Ein Reboot generiert Machine-ID und SSH-Keys sofort neu — und stösst den Firstboot-Lauf an.
 
 Danach in vCenter:
 ```
@@ -548,14 +736,23 @@ Rechtsklick auf VM → Template → Convert to Template
 
 ---
 
-## Part 8 — Deploy & Verify (Post-Clone)
+## Part 8 — Deploy & Verify (Zero-Touch)
 
-Beim Klonen werden drei Dinge individuell pro VM konfiguriert: **Hostname**, **IP-Konfiguration** und **Passwort für `localadmin`**. Dafür stehen zwei Mechanismen zur Verfügung, die zusammenarbeiten:
+Pro VM sind nur noch zwei Dinge individuell: **Hostname** und
+**IP-Konfiguration**. Beides liefert die vCenter Guest OS Customization.
+Alles Weitere — Domain Join, SSSD, Server-Beschreibung — erledigt
+`vb-firstboot.service` im Gast.
 
-| Mechanismus                      | Setzt                                                  |
-|----------------------------------|--------------------------------------------------------|
-| vCenter Guest OS Customization   | Hostname, Domain, IP-Adresse, Gateway, DNS             |
-| cloud-init User-Data             | Passwort für `localadmin`, Server-Beschreibung, Scripte  |
+| Mechanismus                     | Setzt                                          |
+|---------------------------------|------------------------------------------------|
+| vCenter Guest OS Customization  | Hostname, Domain, IP-Adresse, Gateway, DNS     |
+| `vb-firstboot.service` im Gast  | Domain Join, SSSD, `/etc/server-description`   |
+
+> **Warum kein cloud-init User-Data mehr?** Es lässt sich beim Klonen in
+> vCenter nicht mehr hinterlegen. Deshalb liegt die gesamte Logik im Gast —
+> siehe [Part 6c](#part-6c--zero-touch-firstboot-vb-firstboot). Das ist
+> zugleich der Teil, der die spätere Migration auf Proxmox unverändert
+> übersteht.
 
 ### Schritt 18a — Customization Specification in vCenter erstellen
 
@@ -574,25 +771,16 @@ Unter **Menu → Policies and Profiles → VM Customization Specifications** ein
 - DNS-Server: `10.0.1.10, 10.0.1.11` (Domain Controller)
 - DNS-Suchdomain: `int.vitabrevis.ch`
 
+> ⚠️ **Die DNS-Server müssen auf die Domain Controller zeigen.** Der
+> Firstboot-Dienst findet die Domain über die SRV-Records
+> `_ldap._tcp.int.vitabrevis.ch`. Zeigt DNS woanders hin, schlägt der Join
+> fehl und die VM bleibt ungejoint.
+
 > **Hinweis:** Die Customization Spec kann als Vorlage gespeichert und beim Klonen pro VM angepasst werden. Unter *Customize this virtual machine's hardware → Network* lässt sich die IP pro Klon individuell überschreiben.
 
 **Alternativ: DHCP beibehalten** — Wenn der Server seine IP per DHCP erhalten soll, einfach bei NIC 1 *DHCP* auswählen. Die Fallback-Config aus Part 6 greift dann automatisch.
 
-### Schritt 18b — Login-Daten nach dem Klonen
-
-Das Template enthält ein Default-Passwort, das direkt in der cloud-init Config hinterlegt ist. **User-Data ist nicht erforderlich.**
-
-| | |
-|---|---|
-| **User** | `localadmin` |
-| **Passwort** | `Change.Me.Now!` |
-| **Passwortwechsel** | Wird beim ersten Login erzwungen |
-
-> ⚠️ **Wichtig:** Das Default-Passwort sofort nach dem ersten Login ändern. `expire: true` in der cloud-init Config erzwingt dies automatisch.
-
-### Schritt 18c — Klon-Vorgang in vCenter durchführen
-
-Zusammenfassung des Ablaufs:
+### Schritt 18b — Klon-Vorgang in vCenter durchführen
 
 1. **Rechtsklick auf Template → New VM from This Template**
 2. VM-Name eingeben (wird als Hostname übernommen, z.B. `srv-nextcloud-01`)
@@ -600,67 +788,71 @@ Zusammenfassung des Ablaufs:
 4. **Customize operating system** → Gespeicherte Customization Spec auswählen
 5. IP-Adresse für diesen spezifischen Klon anpassen (falls statisch)
 6. Zusammenfassung prüfen → **Finish**
+7. VM einschalten
 
-### cloud-init Phasen beim ersten Boot
+Danach ist nichts mehr zu tun. Der erste Boot dauert etwas länger als üblich,
+weil der Firstboot-Dienst auf cloud-init, Netzwerk und Domain Controller
+wartet.
 
-| Phase   | Was passiert                                              |
-|---------|-----------------------------------------------------------|
-| detect  | VMware Datasource wird via guestInfo erkannt              |
-| local   | Hostname & Machine-ID werden gesetzt (aus Customization)  |
-| network | IP-Konfiguration angewendet, SSH Host Keys erstellt       |
-| config  | Default-Passwort für `localadmin` aktiv, Passwortwechsel erzwungen |
-| final   | write_files Scripts ausgeführt, final_message              |
+> ⚠️ **Die Customization Spec ist Pflicht.** Ohne sie behält der Klon den
+> Hostname des Templates. Der Firstboot-Dienst erkennt das und joint bewusst
+> nicht — sonst entstünde ein Computerobjekt mit Template-Namen im AD.
 
-### Schritt 19 — cloud-init nach dem ersten Boot prüfen
+### Schritt 18c — Login-Daten
+
+| Zugang          | Konto                          | Passwort                                  |
+|-----------------|--------------------------------|-------------------------------------------|
+| **Regulär**     | `<user>@int.vitabrevis.ch`     | AD-Passwort                               |
+| **Break-Glass** | `localadmin`                   | Beim Versiegeln vergeben (Passwortmanager) |
+
+Sudo-Rechte hat die AD-Gruppe `G_server-admin` sowie `localadmin`.
+
+### Was beim ersten Boot abläuft
+
+| Phase                   | Was passiert                                               |
+|-------------------------|------------------------------------------------------------|
+| cloud-init `local`      | Hostname & Machine-ID werden gesetzt (aus Customization)   |
+| cloud-init `network`    | IP-Konfiguration angewendet, SSH Host Keys erstellt        |
+| cloud-init `final`      | Abschluss, danach startet `vb-firstboot.service`           |
+| `vb-firstboot` 1–2      | Wartet auf cloud-init, prüft den Hostname                  |
+| `vb-firstboot` 3–5      | Beschreibung setzen, Credentials lesen, auf DC warten      |
+| `vb-firstboot` 6–8      | `realm join`, SSSD starten, Secret vernichten, Marker      |
+
+### Schritt 19 — Ergebnis prüfen
+
+Ein einziger Aufruf zeigt den kompletten Zustand:
 ```bash
-# Warten bis alle Phasen abgeschlossen sind
+sudo ./post-clone.sh --status
+```
+
+Ausgegeben werden Hostname, Firstboot-Marker, Join-Status, SSSD-Status, die
+Auflösung der AD-Admin-Gruppe und die letzten Zeilen des Firstboot-Logs.
+
+Einzeln nachsehen:
+```bash
+# Firstboot
+sudo cat /var/log/vb-firstboot.log
+sudo journalctl -u vb-firstboot -n 50
+cat /var/lib/vb-template/firstboot.done
+
+# cloud-init
 sudo cloud-init status --wait
-
-# Logs ansehen
-sudo cat /var/log/cloud-init.log
-
-# Detaillierte Timing-Analyse
 sudo cloud-init analyze show
 
-# Prüfen ob Hostname korrekt gesetzt wurde
+# Hostname & Netzwerk
 hostname -f
-hostnamectl
-
-# Prüfen ob IP korrekt konfiguriert ist
 ip addr show
 cat /etc/netplan/*.yaml
-```
 
-### Schritt 20 — Domain erreichbar prüfen
-```bash
-# Domain Controller entdecken
-realm discover int.vitabrevis.ch
-
-# DNS-Auflösung testen
-nslookup int.vitabrevis.ch
-nslookup _ldap._tcp.int.vitabrevis.ch
-```
-
-### Schritt 21 — Domain beitreten ⬅ Post-Clone, mit finalem Hostname
-```bash
-# Sicherstellen, dass keine veraltete Mitgliedschaft existiert
-sudo realm leave 2>/dev/null || true
-sudo rm -f /etc/krb5.keytab
-
-# Mit Domain Admin (oder delegiertem Join-Account)
-sudo realm join --user=Administrator int.vitabrevis.ch
-
-# Mitgliedschaft prüfen
+# Domain
 realm list
+sudo klist -k /etc/krb5.keytab
+getent group G_server-admin@int.vitabrevis.ch
 ```
 
-> **Hinweis:** `realm leave` vor dem Join ist wichtig — ein geklontes Template kann eine veraltete Realm-Mitgliedschaft enthalten. Ohne `realm leave` meldet `realm join` nur "Already joined to this domain" und überspringt die Keytab-Generierung. Falls DNS nicht auf den DC zeigt: `--server=<DC-IP>` anhängen.
-```bash
-# SSSD starten & aktivieren
-sudo systemctl enable --now sssd
-```
+### Schritt 20 — AD-Authentifizierung testen
 
-### Schritt 22 — AD-Authentifizierung testen
+Optional, wenn ein Testkonto zur Hand ist:
 ```bash
 # AD-User nachschlagen
 id john@int.vitabrevis.ch
@@ -677,41 +869,55 @@ sudo sssctl user-show john
 sudo tail -50 /var/log/sssd/sssd_int.vitabrevis.ch.log
 ```
 
-### Schritt 23 — Lokalen Sudo-User `vb-admin` anlegen (Break-Glass-Account)
+### Schritt 21 — Wenn der Firstboot fehlgeschlagen ist
 
-Nach erfolgreichem Domain Join wird auf jedem Klon ein zusätzlicher lokaler
-Sudo-User `vb-admin` angelegt. Er dient als **Break-Glass-Account** für den
-Fall, dass AD/SSSD nicht erreichbar ist (z.B. DC-Ausfall, Netzwerkproblem,
-Kerberos-Issue) — dann ist trotzdem ein lokaler Login mit Sudo-Rechten
-möglich.
+Der Marker `/var/lib/vb-template/firstboot.done` wird nur nach einem
+erfolgreichen Lauf gesetzt. Fehlt er, versucht es der Dienst beim nächsten
+Boot erneut — oder man holt es sofort nach:
 ```bash
-# Interaktive Passwortabfrage durch adduser
-sudo adduser --gecos "VitaBrevis Admin" vb-admin
+# Status ansehen und den Join nachholen
+sudo ./post-clone.sh
 
-# Sudo-Gruppe zuweisen
-sudo usermod -aG sudo vb-admin
+# Join in jedem Fall wiederholen (z.B. nach Umbenennung der VM)
+sudo ./post-clone.sh --force
 ```
 
-> **Hinweis:** `adduser` fragt das Passwort interaktiv ab. Pro Klon ein
-> individuelles, starkes Passwort vergeben und sicher hinterlegen
-> (Passwortmanager / Vault). Der User bleibt persistent auf der VM —
-> im Gegensatz zu `localadmin`, dessen Default-Passwort vom Template stammt
-> und beim ersten Login geändert werden muss.
+`post-clone.sh --force` ruft intern `vb-firstboot.sh --force` auf. Weil das
+Join-Secret nach dem ersten erfolgreichen Join auf dem Klon vernichtet wird,
+fragt es das Passwort des Join-Accounts dann einmalig ab.
 
-Damit `vb-admin` auch via SSH einloggen kann, sollte die SSH-`AllowGroups`-Zeile
-(Part 3, Schritt 4) bereits den lokalen User enthalten — alternativ kann ein
-zusätzlicher User explizit erlaubt werden:
+Ist das Template ohne Firstboot-Automatik gebaut worden, bleibt der manuelle
+Weg:
 ```bash
-# Optional: vb-admin explizit für SSH erlauben
-sudo sed -i 's/^AllowGroups .*/& vb-admin/' /etc/ssh/sshd_config
-sudo systemctl restart sshd
+sudo ./domain-join.sh
 ```
 
-> **Automatisierung:** Diese drei Schritte (Domain Join, AD-Test, vb-admin
-> anlegen) sind in `post-clone.sh` zusammengefasst. Aufruf nach dem Klonen:
-> `sudo ./post-clone.sh`.
+### Schritt 22 — Break-Glass-Passwort pro VM ändern
+
+Standardmässig gilt auf allen Klonen dasselbe Break-Glass-Passwort aus dem
+Template. Wo ein individuelles gewünscht ist:
+```bash
+sudo ./post-clone.sh --password
+```
+
+---
 
 ### Troubleshooting
+
+**Firstboot / Zero-Touch**
+
+| Symptom                                   | Ursache                                      | Lösung                                                        |
+|-------------------------------------------|----------------------------------------------|---------------------------------------------------------------|
+| VM ist nicht gejoint, Marker fehlt         | Firstboot-Lauf fehlgeschlagen                | `sudo cat /var/log/vb-firstboot.log`, dann `sudo ./post-clone.sh --force` |
+| Log: „Hostname ist noch der Template-Hostname" | Klon ohne Customization Spec deployt      | Klon mit Spec neu deployen, oder Hostname setzen und `--force`  |
+| Log: „Keine Default-Route"                 | Netzwerk kam nicht hoch                      | Netplan-Fallback und Portgruppe prüfen                          |
+| Log: „Domain nicht erreichbar"             | DNS zeigt nicht auf die DCs                  | `nslookup _ldap._tcp.int.vitabrevis.ch`, DNS in der Spec korrigieren |
+| Join-Fehler „Insufficient permissions"     | Join-Account hat zu wenig Delegation         | Rechte auf der Computer-OU prüfen (Part 6c, Schritt 12d)       |
+| Firstboot lief gar nicht                   | Marker war beim Versiegeln noch da           | Im Template `rm /var/lib/vb-template/firstboot.done`, neu versiegeln |
+| `join.secret` fehlt auf dem Klon           | Normal nach erfolgreichem Join               | Für einen erneuten Join fragt `post-clone.sh --force` das Passwort ab |
+| Kein Auto-Join, obwohl gewünscht           | Beim Bau kein Join-Passwort angegeben        | `ENABLE_JOIN` in `/etc/vb-template/firstboot.conf` prüfen, Secret nachtragen |
+
+**System & Active Directory**
 
 | Symptom                          | Ursache                             | Lösung                                          |
 |----------------------------------|-------------------------------------|-------------------------------------------------|
@@ -719,8 +925,7 @@ sudo systemctl restart sshd
 | Keine Netzwerkverbindung         | Netplan-Config fehlt                | `99-fallback-dhcp.yaml` vorhanden?              |
 | Hostname ist noch der alte       | Customization Spec nicht ausgewählt | Klon erneut mit Spec deployen                   |
 | IP-Adresse stimmt nicht          | DHCP überschreibt statische Config  | Fallback-Config Priorität prüfen (99 vs 50)     |
-| `localadmin` Login verweigert    | Passwort nicht gesetzt / User locked | User-Data in cloud-init Logs prüfen            |
-| `vb-admin` Login verweigert      | User nicht in `AllowGroups` / kein Sudo | `usermod -aG sudo vb-admin`, `AllowGroups` in sshd_config prüfen |
+| `localadmin` Login verweigert    | Passwort nicht gesetzt / User locked | Wurde `seal-template.sh` ausgeführt? Es vergibt das Passwort |
 | `id: user not found`            | SSSD läuft nicht / falsche Domain   | `systemctl restart sssd; realm list`            |
 | SSSD crashed: `krb5.keytab not found` | SSSD enabled vor Domain Join   | `systemctl disable sssd`, erst nach `realm join` aktivieren |
 | `Already joined` + keytab fehlt  | Veraltete Realm-Mitgliedschaft vom Template | `realm leave`, `rm /etc/krb5.keytab`, dann neu joinen |
@@ -736,68 +941,49 @@ sudo systemctl restart sshd
 
 ---
 
-## Part 9 — seal-template.sh
+## Part 9 — Template aktualisieren
 
-Dieses Script in `/usr/local/sbin/seal-template.sh` speichern und vor jedem Template-Update ausführen. Es automatisiert den gesamten Part 7.
+Ein Template will regelmässig gepatcht werden. Der Ablauf:
+
+1. In vCenter: **Rechtsklick auf das Template → Convert to Virtual Machine**
+2. VM einschalten und als `localadmin` anmelden
+
+   Die Wartungs-VM behält den Hostname des Templates. `vb-firstboot.service`
+   erkennt das und joint bewusst **nicht** — siehe
+   [Part 6c](#der-hostname-schutz). Es ist also nichts abzuschalten.
+
+3. Updates einspielen und Änderungen vornehmen:
+   ```bash
+   sudo apt update && sudo apt upgrade -y
+   ```
+4. Versiegeln — hier wird auch das Break-Glass-Passwort neu vergeben und die
+   Firstboot-Automatik wieder scharf geschaltet:
+   ```bash
+   cd ~/ubuntu-templating && git pull
+   sudo ./seal-template.sh
+   ```
+5. Herunterfahren (**nicht** neu starten) und zurück konvertieren:
+   ```bash
+   sudo shutdown -h now
+   ```
+   Dann: **Rechtsklick auf VM → Template → Convert to Template**
+
+### Was dabei rotiert werden sollte
+
+| Secret                        | Wo                                         | Wann                       |
+|-------------------------------|---------------------------------------------|----------------------------|
+| Break-Glass-Passwort          | Abfrage von `seal-template.sh`              | Bei jedem Template-Rebuild |
+| Passwort des Join-Accounts    | `/etc/vb-template/join.secret`              | Bei jedem Template-Rebuild |
+| SNMP Community                | Abfrage von `prepare-template.sh`           | Nach Bedarf                |
+
+Das Join-Secret nachträglich ersetzen, ohne `prepare-template.sh` erneut
+laufen zu lassen:
 ```bash
-#!/bin/bash
-# ─────────────────────────────────────────────────────────────────
-#  seal-template.sh — Ubuntu VM für VMware Template vorbereiten
-#  Verwendung: sudo ./seal-template.sh
-# ─────────────────────────────────────────────────────────────────
-set -euo pipefail
-
-echo "==> [1/10] cloud-init State löschen..."
-cloud-init clean --logs --seed
-
-echo "==> [2/10] Machine-ID zurücksetzen..."
-truncate -s 0 /etc/machine-id
-rm -f /var/lib/dbus/machine-id
-ln -s /etc/machine-id /var/lib/dbus/machine-id
-
-echo "==> [3/10] SSH Host Keys löschen..."
-rm -f /etc/ssh/ssh_host_*
-
-echo "==> [4/10] Netplan cloud-init Config entfernen (Fallback bleibt erhalten)..."
-rm -f /etc/netplan/50-cloud-init.yaml
-
-echo "==> [5/10] localadmin Passwort auf Default zuruecksetzen..."
-echo "localadmin:Change.Me.Now!" | chpasswd
-chage -d 0 localadmin
-
-echo "==> [6/10] Domain-Mitgliedschaft entfernen (Klon muss neu joinen)..."
-realm leave 2>/dev/null || true
-rm -f /etc/krb5.keytab
-
-echo "==> [7/10] SSSD stoppen & deaktivieren (wird nach realm join aktiviert)..."
-systemctl disable sssd 2>/dev/null || true
-systemctl stop sssd 2>/dev/null || true
-
-echo "==> [8/10] Shell History & Temp-Dateien löschen..."
-truncate -s 0 /root/.bash_history
-truncate -s 0 /home/*/.bash_history 2>/dev/null || true
-rm -rf /tmp/* /var/tmp/*
-
-echo "==> [9/10] Package Cache & Logs bereinigen..."
-apt autoremove -y && apt clean
-journalctl --rotate
-journalctl --vacuum-time=1s
-find /var/log -type f -exec truncate -s 0 {} \;
-
-echo "==> [10/10] SSSD Cache wird bewusst behalten..."
-# sssctl cache-remove -o     # auskommentieren um SSSD Cache ebenfalls zu löschen
-
-echo ""
-echo "✔  Template erfolgreich versiegelt."
-echo "   VM jetzt herunterfahren: sudo shutdown -h now"
-echo "   Danach in vCenter zu Template konvertieren."
-```
-```bash
-# Ausführbar machen
-sudo chmod +x /usr/local/sbin/seal-template.sh
-
-# Vor jedem Template-Update ausführen
-sudo seal-template.sh
+printf '%s' '<neues-passwort>' | sudo tee /etc/vb-template/join.secret >/dev/null
+sudo chmod 600 /etc/vb-template/join.secret
+sudo chown root:root /etc/vb-template/join.secret
 ```
 
-> **Hinweis:** Das Script entfernt die Domain-Mitgliedschaft (Schritt 6/10), setzt das `localadmin`-Passwort auf den Default `Change.Me.Now!` zurück (Schritt 5/10) und deaktiviert SSSD (Schritt 7/10). Der Passwortwechsel wird beim ersten Login erzwungen (`chage -d 0`).
+> **Hinweis:** Die Scripts liegen im Repository, nicht im Template. Vor dem
+> Versiegeln das Repo auf der Wartungs-VM aktualisieren, damit die aktuelle
+> Version von `firstboot.sh` installiert wird.
