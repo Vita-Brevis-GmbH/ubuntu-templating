@@ -113,9 +113,27 @@ datasource_list: [VMware, OVF, None]
 datasource:
   VMware:
     allow_raw_data: true
-  OVF:
-    transport: [com.vmware.guestInfo, iso]
 ```
+
+> **`datasource_list` muss einzeilig bleiben.** `ds-identify` ist ein
+> Shell-Script mit zeilenweisem Parser und liest ein mehrzeiliges Array nicht.
+> Seit cloud-init 25.1 verlangt `ds-identify` zudem eine eindeutige
+> Identifikation über DMI, Kernel-Cmdline oder genau diese explizite Liste.
+
+> **Kein `OVF: transport:` mehr.** Der Schlüssel sah load-bearing aus, war es
+> aber nie: `DataSourceOVF.py` hat die Transportliste fest im Code
+> (`com.vmware.guestInfo`, dann `iso`) und liest dafür gar keine
+> Konfiguration. Das galt schon auf 24.04. Die gewünschte Reihenfolge ist
+> ohnehin die eingebaute.
+
+> **Zu `allow_raw_data`:** Der Schlüssel greift nur, wenn zusätzlich
+> `disable_vmware_customization: false` als **Top-Level-Key** in
+> `/etc/cloud/cloud.cfg` steht. Das setzen wir bewusst **nicht**. Ohne ihn
+> gilt der Standard `true`, und die Guest Customization läuft über den
+> klassischen Pfad in `open-vm-tools` statt über cloud-init. Genau so
+> funktioniert das Setup heute. Wer auf cloud-init-basierte Customization
+> umstellen will, setzt den Key — das ist aber eine bewusste Umstellung mit
+> eigenem Testbedarf, kein Nachziehen einer fehlenden Zeile.
 
 ### Schritt 3 — /etc/cloud/cloud.cfg prüfen
 
@@ -137,7 +155,6 @@ system_info:
 ssh_pwauth: true
 
 cloud_init_modules:
-  - migrator
   - seed_random
   - bootcmd
   - write_files
@@ -148,10 +165,10 @@ cloud_init_modules:
   - set_hostname
   - update_hostname
   - update_etc_hosts
+  - set_passwords
 
 cloud_config_modules:
   - ssh
-  - set_passwords
   - package_update_upgrade_install
 
 cloud_final_modules:
@@ -163,7 +180,20 @@ cloud_final_modules:
   - final_message
 ```
 
-> **Hinweis:** Durch `system_info.default_user` weiss cloud-init, dass `localadmin` der Hauptbenutzer ist. `ssh_pwauth: true` erlaubt SSH-Login mit Passwort.
+> **`system_info.default_user` ist hier rein deklarativ.** Wirksam würde der
+> Block erst durch das Modul `users_groups`, und das steht bewusst **nicht**
+> in der Liste: `localadmin` legt `prepare-template.sh` per `adduser` an, nicht
+> cloud-init. Liefe `users_groups`, schriebe cloud-init zusätzlich
+> `/etc/sudoers.d/90-cloud-init-users` mit `NOPASSWD` — das soll das
+> Break-Glass-Konto nicht bekommen.
+
+> **`migrator` ist raus.** Das Modul wurde in cloud-init 24.1 entfernt. Es in
+> der Liste zu lassen ist nicht fatal, erzeugt aber bei jedem Boot einen
+> Logeintrag.
+
+> **`set_passwords` steht in der init-Stage.** Ubuntu hat es ab 26.04 selbst
+> aus `cloud_config_modules` dorthin verschoben. Es wendet bei uns nur
+> `ssh_pwauth: true` an, das den SSH-Login mit Passwort erlaubt.
 
 > ⚠️ **Bewusst kein `chpasswd`-Block:** Früher stand das Default-Passwort
 > zusätzlich hier. Das Ergebnis waren zwei konkurrierende Quellen für dasselbe
@@ -229,7 +259,7 @@ sudo vim /etc/systemd/system/ssh-host-keys.service
 ```ini
 [Unit]
 Description=Generate SSH host keys if missing
-Before=ssh.socket ssh.service sshd.service
+Before=ssh.service sshd.service sshd@.service
 ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
 
 [Service]
@@ -238,7 +268,7 @@ ExecStart=/usr/bin/ssh-keygen -A
 RemainAfterExit=yes
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target ssh.socket
 ```
 ```bash
 sudo systemctl daemon-reload
@@ -247,12 +277,20 @@ sudo systemctl enable ssh-host-keys.service
 
 > **Hinweis:** `ConditionPathExistsGlob` sorgt dafür, dass der Service nur läuft wenn tatsächlich keine Keys vorhanden sind — auf einer laufenden VM hat er also keinen Effekt.
 
-> **Warum `ssh.socket` in der `Before=`-Zeile steht:** Seit Ubuntu 22.10 ist
-> sshd socket-aktiviert. Nicht `ssh.service` lauscht auf Port 22, sondern
-> `ssh.socket`, und die Host Keys braucht die pro Verbindung gestartete
-> Instanz. Ohne diese Ordnung könnte die erste Verbindung eintreffen, bevor
-> die Keys erzeugt sind. Units, die es auf einem System nicht gibt, sind in
-> `Before=` wirkungslos — die Zeile ist deshalb auf beiden Varianten korrekt.
+> **Warum `ssh.socket` in `WantedBy=` steht, aber nicht in `Before=`:** Seit
+> Ubuntu 22.10 ist sshd socket-aktiviert. `ssh.socket` bindet den Port und
+> braucht selbst keine Host Keys — die braucht der Dienst, der die Verbindung
+> annimmt. Ein `Before=ssh.socket` würde nur das Binden des Ports verzögern.
+> In `WantedBy=` gehört der Socket dagegen schon, denn bei Socket-Aktivierung
+> startet `ssh.service` beim Booten gar nicht, und die Unit soll trotzdem mit
+> angezogen werden. Genau diese Aufteilung verwendet auch das
+> `sshd-keygen.service`, das Ubuntu ab 26.04 selbst mitliefert.
+
+> **Auf 26.04 gibt es das Paket-Pendant.** `openssh-server` bringt dort ein
+> eigenes `sshd-keygen.service` mit (`ConditionFirstBoot=yes`). Beide Units
+> sind idempotent und stören sich nicht. Wichtig ist nur, die eigene Unit
+> **nicht** `sshd-keygen.service` zu nennen — eine gleichnamige Datei in
+> `/etc/systemd/system/` würde die des Pakets still überschreiben.
 
 ---
 
@@ -486,11 +524,24 @@ network:
         name: "en*"
       dhcp4: true
       dhcp6: false
+      optional: true
 ```
 ```bash
 sudo chmod 600 /etc/netplan/99-fallback-dhcp.yaml
 sudo netplan apply
 ```
+
+> **`optional: true` ist der netplan-eigene Hebel gegen blockierende Boots.**
+> Ab netplan 1.2 (Ubuntu 26.04) schreibt der Generator für jedes
+> **nicht**-optionale Interface ein `ExecStart`-Override von
+> `systemd-networkd-wait-online`, das auf eine routbare Adresse **und** auf DNS
+> wartet. Optional markierte Netdefs überspringt er, und ohne nicht-optionale
+> Netdefs legt er den Wants-Link auf die Unit gar nicht erst an. Zusammen mit
+> dem Maskieren in Schritt 12 ist der Boot damit doppelt abgesichert.
+
+> **Die `0600` sind kein Muss, aber richtig.** Netplan warnt nur, wenn Gruppe
+> oder Andere Lese- oder Schreibrechte haben, und generiert trotzdem.
+> cloud-init schreibt sein eigenes `50-cloud-init.yaml` ebenfalls mit `0600`.
 
 ### Schritt 12 — systemd-networkd-wait-online deaktivieren
 
@@ -1060,8 +1111,9 @@ Scripts deswegen anders aussehen als früher.
 | `sudo` | sudo 1.9.x | **sudo-rs** als Standard-Anbieter | ja, siehe unten |
 | coreutils | GNU | **uutils** (Rust), `cp`/`mv`/`rm` bleiben GNU | nein |
 | OpenSSH | 9.6 | 10.2, DSA entfernt | nein, wir nutzen kein DSA |
-| sshd-Start | socket-aktiviert | socket-aktiviert | ja, Unit-Ordnung |
-| cloud-init | einzelnes Paket | Metapaket + `cloud-init-base` | nein |
+| sshd-Start | socket-aktiviert | socket-aktiviert, `sshd-keygen.service` neu | ja, Unit-Ordnung |
+| cloud-init | 24.1 | 26.1, Metapaket + `cloud-init-base` | nur beim Deinstallieren |
+| netplan | 1.0 | 1.2, wait-online wartet auch auf DNS | ja, `optional: true` |
 | PHP (Nextcloud) | 8.3 | 8.5 | ja, getrennte Deploy-Scripts |
 
 ### sudo-rs — die eine wirklich brechende Änderung
@@ -1135,6 +1187,47 @@ Konsequenzen, beide in den Scripts berücksichtigt:
   Bei inaktiver `ssh.service` ist das ein No-op, und das ist richtig: jede
   neue Verbindung liest die Konfiguration ohnehin frisch ein.
 
+### cloud-init 26.1
+
+**`system_info.default_user` gilt unverändert.** Der Block ist genau das, was
+Ubuntu selbst in `/etc/cloud/cloud.cfg` ausliefert, und wird zur Laufzeit
+gelesen. Es gibt zwar ein `deprecated: true` im JSON-Schema, das betrifft
+aber ausschliesslich die Validierung von **User-Data und Vendor-Data**, nicht
+die Basiskonfiguration. Gegenprobe: dasselbe Schema kennt `datasource_list`
+gar nicht — würde es `cloud.cfg` prüfen, fiele jedes Standard-Ubuntu durch.
+Ein Ersatzschlüssel ist nicht dokumentiert, ein Entfernungsdatum auch nicht.
+
+Drei Dinge in unserer `cloud.cfg` haben sich trotzdem geändert:
+
+| Was | Warum |
+|-----|-------|
+| `migrator` entfernt | In cloud-init 24.1 gestrichen, erzeugt sonst nur Lograuschen |
+| `set_passwords` in die init-Stage | Ubuntu hat es ab 26.04 selbst dorthin verschoben |
+| `OVF: transport:` entfernt | War nie ein echter Schlüssel, siehe Part 2 |
+
+**`cloud-init status --wait` kennt drei Exit-Codes.** `0` ist sauber, `1` ein
+harter Fehler, **`2` ein behebbarer Fehler** (degraded). Unter `set -e` würde
+ein bloss degradierter Boot ein Script abbrechen. `firstboot.sh` läuft
+bewusst ohne `-e` und behandelt jeden Nicht-Null-Code als Warnung.
+
+**Paketaufteilung:** `cloud-init` ist ein leeres Metapaket, die
+Implementierung samt `/etc/cloud/cloud.cfg` steckt in `cloud-init-base`. Für
+`apt-get install cloud-init` ändert sich nichts, wohl aber für ein
+`apt purge cloud-init` — das entfernt die Implementierung nicht mehr mit.
+
+### netplan 1.2
+
+Die Syntax bleibt gültig, inklusive Glob in `match: name:`. Geändert hat sich
+das Verhalten rund um `systemd-networkd-wait-online`: Der Generator schreibt
+jetzt für jedes nicht-optionale Interface ein `ExecStart`-Override, das auf
+eine routbare Adresse **und** auf DNS wartet. Deshalb trägt der
+DHCP-Fallback jetzt `optional: true`. Das Maskieren der Unit bleibt als
+zweite Absicherung bestehen.
+
+Die Unit heisst weiterhin `systemd-networkd-wait-online.service`, und
+Maskieren wirkt weiterhin: eine Maske ist ein Symlink nach `/dev/null` unter
+`/etc/systemd/system` und sticht die vom Generator erzeugten Wants.
+
 ### Pakete
 
 Alle von den Scripts installierten Pakete existieren in 26.04 unverändert
@@ -1142,11 +1235,6 @@ unter demselben Namen. Drei liegen in **universe**: `oddjob`,
 `oddjob-mkhomedir` und `krb5-user`. Auf einer Server-Installation ist
 universe standardmässig aktiv. Bei einem minimalen Container-Image mit nur
 `main` scheitert die Installation genau an diesen dreien.
-
-`cloud-init` ist in 26.04 ein Metapaket, die Implementierung steckt in
-`cloud-init-base`. Für `apt-get install cloud-init` ändert sich nichts,
-wohl aber für ein `apt purge cloud-init` — das entfernt die Implementierung
-nicht mehr mit.
 
 ### Was die Scripts selbst prüfen
 

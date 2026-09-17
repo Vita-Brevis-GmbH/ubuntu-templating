@@ -219,13 +219,21 @@ echo "    Part 1 abgeschlossen."
 log "cloud-init konfigurieren"
 
 # VMware Datasource
+#
+# 'datasource_list' muss einzeilig bleiben: ds-identify ist ein
+# Shell-Script mit zeilenweisem Parser und liest ein mehrzeiliges Array
+# nicht. Seit cloud-init 25.1 verlangt ds-identify ausserdem eine
+# eindeutige Identifikation — diese explizite Liste ist genau das.
+#
+# Kein 'OVF: transport:' mehr: DataSourceOVF.py hat die Transportliste
+# fest im Code (com.vmware.guestInfo, dann iso) und liest dafuer gar
+# keine Konfiguration. Der Schluessel war immer wirkungslos, auch auf
+# 24.04 — die gewuenschte Reihenfolge ist ohnehin die eingebaute.
 cat > /etc/cloud/cloud.cfg.d/99-vmware.cfg <<'EOF'
 datasource_list: [VMware, OVF, None]
 datasource:
   VMware:
     allow_raw_data: true
-  OVF:
-    transport: [com.vmware.guestInfo, iso]
 EOF
 echo "    /etc/cloud/cloud.cfg.d/99-vmware.cfg geschrieben."
 
@@ -242,6 +250,12 @@ cat > /etc/cloud/cloud.cfg <<EOF
 # Quellen fuer dasselbe Passwort.
 preserve_hostname: false
 
+# Deklarativ. Wirksam wird dieser Block erst durch das Modul
+# 'users_groups', und das steht bewusst NICHT in der Liste unten:
+# '${DEFAULT_USER}' wird von diesem Script per adduser angelegt, nicht
+# von cloud-init. Wuerde 'users_groups' laufen, schriebe cloud-init
+# zusaetzlich /etc/sudoers.d/90-cloud-init-users mit NOPASSWD — das
+# soll der Break-Glass-Account nicht bekommen.
 system_info:
   default_user:
     name: ${DEFAULT_USER}
@@ -251,8 +265,9 @@ system_info:
     sudo: ["ALL=(ALL) NOPASSWD:ALL"]
     shell: /bin/bash
 
+# 'migrator' ist seit cloud-init 24.1 entfernt und steht deshalb nicht
+# mehr in der Liste — es wuerde nur eine Meldung im Log erzeugen.
 cloud_init_modules:
-  - migrator
   - seed_random
   - bootcmd
   - write_files
@@ -263,12 +278,15 @@ cloud_init_modules:
   - set_hostname
   - update_hostname
   - update_etc_hosts
+  - set_passwords
 
 cloud_config_modules:
   - ssh
-  - set_passwords
   - package_update_upgrade_install
 
+# Wird vom Modul 'set_passwords' angewendet. Das steht oben in der
+# init-Stage, so wie es Ubuntu ab 26.04 auch selbst ausliefert — dort
+# ist es aus cloud_config_modules dorthin gewandert.
 ssh_pwauth: true
 
 cloud_final_modules:
@@ -291,13 +309,12 @@ log "SSH Host-Key Service einrichten"
 cat > /etc/systemd/system/ssh-host-keys.service <<'EOF'
 [Unit]
 Description=Generate SSH host keys if missing
-# ssh.socket muss mit aufgefuehrt sein: seit Ubuntu 22.10 ist sshd
-# socket-aktiviert. Die Host Keys braucht dann die pro Verbindung
-# gestartete Instanz, nicht ssh.service — ohne diese Ordnung koennte
-# die erste Verbindung vor der Key-Erzeugung eintreffen.
-# Nicht existierende Units in Before= sind wirkungslos, die Zeile ist
-# also auf beiden Varianten korrekt.
-Before=ssh.socket ssh.service sshd.service
+# Ordnung wie in dem 'sshd-keygen.service', das Ubuntu ab 26.04 selbst
+# mitliefert: ssh.socket steht bewusst NICHT in Before=. Der Socket
+# bindet nur den Port und braucht keine Host Keys — die braucht der
+# Dienst, der die Verbindung annimmt. Ein Before=ssh.socket wuerde das
+# Binden des Ports unnoetig verzoegern.
+Before=ssh.service sshd.service sshd@.service
 ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
 
 [Service]
@@ -306,7 +323,10 @@ ExecStart=/usr/bin/ssh-keygen -A
 RemainAfterExit=yes
 
 [Install]
-WantedBy=multi-user.target
+# ssh.socket gehoert dagegen in WantedBy: bei Socket-Aktivierung startet
+# ssh.service beim Booten gar nicht, die Unit soll aber trotzdem mit dem
+# Socket zusammen angezogen werden.
+WantedBy=multi-user.target ssh.socket
 EOF
 
 systemctl daemon-reload
@@ -549,6 +569,13 @@ echo "    Part 5 abgeschlossen."
 # ================================================================
 log "Netzwerk-Fallback konfigurieren"
 
+# 'optional: true' ist der netplan-eigene Hebel gegen blockierende
+# Boots. Ab netplan 1.2 (Ubuntu 26.04) erzeugt der Generator fuer jedes
+# nicht-optionale Interface ein ExecStart-Override von
+# systemd-networkd-wait-online, das auf eine routbare Adresse UND auf
+# DNS wartet. Optional markierte Netdefs werden dabei uebersprungen.
+# Zusammen mit dem Maskieren der Unit weiter unten ist der Boot damit
+# doppelt abgesichert.
 cat > /etc/netplan/99-fallback-dhcp.yaml <<'EOF'
 network:
   version: 2
@@ -558,6 +585,7 @@ network:
         name: "en*"
       dhcp4: true
       dhcp6: false
+      optional: true
 EOF
 chmod 600 /etc/netplan/99-fallback-dhcp.yaml
 echo "    /etc/netplan/99-fallback-dhcp.yaml geschrieben."
