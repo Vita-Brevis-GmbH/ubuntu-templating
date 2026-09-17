@@ -1,10 +1,16 @@
-# Ubuntu 24.04 LTS — VMware Template Guide
+# Ubuntu LTS — VMware Template Guide
 
-*cloud-init · SSSD · Active Directory · Zero-Touch Deployment · Ubuntu 24.04 LTS*
+*cloud-init · SSSD · Active Directory · Zero-Touch Deployment · Ubuntu 26.04 / 24.04 LTS*
 
-Anleitung zum Bauen eines Ubuntu-24.04-Templates in VMware vSphere mit
+Anleitung zum Bauen eines Ubuntu-Templates in VMware vSphere mit
 cloud-init, SSH-Hardening, dynamischem MOTD, SSSD/Active-Directory-Anbindung
 und sauberem Versiegeln vor dem Konvertieren zum Template.
+
+Die Template-Scripts laufen auf **Ubuntu 26.04 LTS** und **24.04 LTS**.
+Was sich zwischen den beiden unterscheidet und wie die Scripts damit umgehen,
+steht in [Part 10](#part-10--unterschiede-zwischen-2604-und-2404-lts).
+Die Rollen-Deploys für Nextcloud sind je Release getrennt, weil sich die
+PHP-Version unterscheidet.
 
 ## Der Deployment-Ablauf in Kürze
 
@@ -52,7 +58,7 @@ automatisieren:
 
 ## Part 1 — VM Preparation
 
-Start mit einer frisch installierten Ubuntu 24.04 LTS VM in vSphere. Minimale Installation, kein Desktop.
+Start mit einer frisch installierten Ubuntu LTS VM in vSphere (26.04 oder 24.04). Minimale Installation, kein Desktop.
 
 ### Schritt 1 — System aktualisieren & Pakete installieren
 ```bash
@@ -172,7 +178,7 @@ cloud_final_modules:
 ### Schritt 4 — sshd absichern
 
 `prepare-template.sh` erledigt das automatisch. Statt `/etc/ssh/sshd_config`
-zu verändern, schreibt es ein Drop-in — Ubuntu 24.04 zieht
+zu verändern, schreibt es ein Drop-in — Ubuntu zieht
 `/etc/ssh/sshd_config.d/*.conf` ganz oben ein, damit gewinnen diese Werte
 und ein Distributions-Update kann sie nicht überschreiben.
 ```bash
@@ -197,8 +203,14 @@ AllowGroups sudo localadmin G_server-admin@int.vitabrevis.ch
 ```bash
 # Erst validieren, dann aktivieren — eine kaputte Config sperrt beim
 # nächsten Reconnect aus.
-sudo sshd -t && sudo systemctl reload ssh
+sudo sshd -t && sudo systemctl try-reload-or-restart ssh
 ```
+
+> **Hinweis:** `try-reload-or-restart` wirkt nur auf eine aktive Unit. Bei
+> socket-aktiviertem sshd ist `ssh.service` inaktiv und der Befehl ein
+> No-op. Das ist richtig so: dort liest jede neue Verbindung die
+> Konfiguration ohnehin frisch ein. Ein `systemctl restart ssh` wäre an
+> dieser Stelle falsch, es würde den Dauer-Daemon neben dem Socket starten.
 
 > **Hinweis:** `AllowGroups` enthält neben der AD-Gruppe auch `sudo` und
 > `localadmin`. Damit bleibt der Break-Glass-Zugang offen, solange die Domain
@@ -217,7 +229,7 @@ sudo vim /etc/systemd/system/ssh-host-keys.service
 ```ini
 [Unit]
 Description=Generate SSH host keys if missing
-Before=ssh.service sshd.service
+Before=ssh.socket ssh.service sshd.service
 ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
 
 [Service]
@@ -233,7 +245,14 @@ sudo systemctl daemon-reload
 sudo systemctl enable ssh-host-keys.service
 ```
 
-> **Hinweis:** `ConditionPathExistsGlob` sorgt dafür, dass der Service nur läuft wenn tatsächlich keine Keys vorhanden sind — auf einer laufenden VM hat er also keinen Effekt. `Before=ssh.service` garantiert, dass die Keys bereitstehen bevor sshd startet.
+> **Hinweis:** `ConditionPathExistsGlob` sorgt dafür, dass der Service nur läuft wenn tatsächlich keine Keys vorhanden sind — auf einer laufenden VM hat er also keinen Effekt.
+
+> **Warum `ssh.socket` in der `Before=`-Zeile steht:** Seit Ubuntu 22.10 ist
+> sshd socket-aktiviert. Nicht `ssh.service` lauscht auf Port 22, sondern
+> `ssh.socket`, und die Host Keys braucht die pro Verbindung gestartete
+> Instanz. Ohne diese Ordnung könnte die erste Verbindung eintreffen, bevor
+> die Keys erzeugt sind. Units, die es auf einem System nicht gibt, sind in
+> `Before=` wirkungslos — die Zeile ist deshalb auf beiden Varianten korrekt.
 
 ---
 
@@ -407,13 +426,28 @@ sudo visudo -f /etc/sudoers.d/ad-admins
 ```
 ```
 # Sudo für AD-Gruppe 'G_server-admin' erlauben
-# Gruppenname mit '@' in doppelte Anführungszeichen setzen — modernes
-# sudo (1.9.x, Ubuntu 24.04) lehnt den Backslash-Escape '\@' als
-# "illegal escape sequence" ab.
-"%G_server-admin@int.vitabrevis.ch" ALL=(ALL) ALL
+# Gruppenname OHNE Anführungszeichen, Leerzeichen mit Backslash escapen.
+%G_server-admin@int.vitabrevis.ch ALL=(ALL) ALL
 
 # Ohne Passwort (mit Bedacht verwenden)
-# "%G_server-admin@int.vitabrevis.ch" ALL=(ALL) NOPASSWD: ALL
+# %G_server-admin@int.vitabrevis.ch ALL=(ALL) NOPASSWD: ALL
+
+# Gruppenname mit Leerzeichen:
+# %domain\ admins@int.vitabrevis.ch ALL=(ALL) ALL
+```
+
+> ⚠️ **Keine Anführungszeichen um den Gruppennamen.** Ab Ubuntu 26.04 ist
+> `sudo-rs` der Standard-Anbieter von `/usr/bin/sudo`. Dessen Parser
+> akzeptiert `@` mitten im Namen, kennt aber keine Anführungszeichen — ein
+> führendes `"` ist dort ein Syntaxfehler, und eine ungültige Datei in
+> `/etc/sudoers.d` macht `sudo` systemweit unbrauchbar. Auch der früher
+> übliche Escape `\@` fällt weg, `sudo-rs` kennt nur `\\ \" \, \: \= \! \( \)`
+> und das Leerzeichen. Die Schreibweise oben funktioniert auf beiden
+> Releases. Details in [Part 10](#part-10--unterschiede-zwischen-2604-und-2404-lts).
+
+Anschliessend immer validieren:
+```bash
+sudo visudo -c -f /etc/sudoers.d/ad-admins
 ```
 
 ### Schritt 10b — SSSD & Domain-Mitgliedschaft auf dem Template bereinigen
@@ -517,11 +551,33 @@ sudo systemctl enable --now snmpd
 > die Monitoring-Server beschränkt werden.
 
 ### Schritt 12c — Erreichbarkeit testen
-Vom Monitoring-Host:
+Vom Monitoring-Host, mit numerischen OIDs:
 ```bash
-snmpwalk -v 2c -c <community> <host> system
-snmpget  -v 2c -c <community> <host> hrSystemUptime.0
+# sysDescr.0 — bestätigt, dass Daemon und Community stimmen
+snmpget  -v 2c -c <community> <host> .1.3.6.1.2.1.1.1.0
+
+# Der ganze system-Teilbaum
+snmpwalk -v 2c -c <community> <host> .1.3.6.1.2.1.1
+
+# hrSystemUptime.0
+snmpget  -v 2c -c <community> <host> .1.3.6.1.2.1.25.1.1.0
 ```
+
+> ⚠️ **Symbolische Namen wie `sysDescr.0` oder `system` funktionieren nur,
+> wenn die MIB-Dateien lokal vorliegen.** Die stecken in
+> `snmp-mibs-downloader` aus dem multiverse-Repository und sind auf einem
+> Standard-Ubuntu nicht installiert. Ohne sie antwortet `snmpget` mit
+> *Unknown Object Identifier*, obwohl snmpd einwandfrei läuft. Numerische
+> OIDs brauchen keine MIBs. Wer lieber mit Namen arbeitet:
+> ```bash
+> sudo add-apt-repository multiverse && sudo apt install -y snmp-mibs-downloader
+> ```
+
+> **Hinweis zu `/etc/default/snmpd`:** Die systemd-Unit von snmpd hat kein
+> `EnvironmentFile` und baut ihre Kommandozeile fest zusammen. `SNMPDOPTS`
+> aus `/etc/default/snmpd` wird deshalb nicht gelesen — Änderungen dort
+> haben keinen Effekt. Die Lauschadresse kommt aus `agentAddress` in der
+> `snmpd.conf`.
 
 > **Hinweis:** snmpd wird im Template aktiv gelassen — beim Klonen
 > startet der Service automatisch mit; `sysName` wird dynamisch aus
@@ -932,8 +988,10 @@ sudo ./post-clone.sh --password
 | `realm join`: Insufficient permissions | Join-Account hat zu wenig Rechte | Delegation auf OU: Write All Properties auf Computer Objects |
 | `kinit`: KDC reply did not match | `[domain_realm]` fehlt oder falsch  | MIT-Defaults ersetzen, `dns_canonicalize_hostname = false` setzen |
 | Kerberos Auth schlägt fehl       | Clock Skew > 5 Minuten             | `sudo ntpdate -u <DC-IP>; timedatectl`          |
-| AD-User: not in sudoers file     | Gruppenname mit `@` nicht gequotet | `"%G_server-admin@int.vitabrevis.ch"` (in Anführungszeichen) verwenden |
-| `visudo`: illegal escape sequence | `\@`-Escape von altem sudo entfernt | Backslash weg, Gruppenname stattdessen quoten: `"%grp@domain"` |
+| AD-User: not in sudoers file     | Gruppenname falsch geschrieben      | Unquotiert schreiben: `%G_server-admin@int.vitabrevis.ch`, siehe [Part 10](#sudo-rs--die-eine-wirklich-brechende-änderung) |
+| `sudo` streikt komplett nach Änderung an `sudoers.d` | Datei parst unter sudo-rs nicht (Anführungszeichen, `\@`) | Aus einer Root-Shell: Datei entfernen, unquotiert neu schreiben, `visudo -c -f` prüfen |
+| `visudo`: Syntaxfehler bei `"%grp@domain"` | sudo-rs kennt keine Anführungszeichen | Anführungszeichen weg, Leerzeichen mit `\ ` escapen |
+| SNMP: `Unknown Object Identifier` | MIB-Dateien fehlen (`snmp-mibs-downloader`) | Numerische OID verwenden, z.B. `.1.3.6.1.2.1.1.1.0` |
 | Sudoers-Änderung greift nicht    | SSSD cached Gruppenmitgliedschaft  | `rm -rf /var/lib/sss/db/*`, SSSD restart, neu einloggen |
 | Login verweigert                 | User nicht in erlaubter Gruppe      | `ad_access_filter` oder `AllowGroups` prüfen    |
 | Home-Verzeichnis fehlt           | pam_mkhomedir nicht aktiv           | `pam-auth-update --enable mkhomedir`            |
@@ -987,3 +1045,112 @@ sudo chown root:root /etc/vb-template/join.secret
 > **Hinweis:** Die Scripts liegen im Repository, nicht im Template. Vor dem
 > Versiegeln das Repo auf der Wartungs-VM aktualisieren, damit die aktuelle
 > Version von `firstboot.sh` installiert wird.
+
+---
+
+## Part 10 — Unterschiede zwischen 26.04 und 24.04 LTS
+
+Die Template-Scripts laufen auf beiden Releases. Ubuntu 26.04 LTS
+("Resolute Raccoon") tauscht aber einige Kernkomponenten aus. Was davon
+diese Scripts betrifft, steht hier — inklusive der Stellen, an denen die
+Scripts deswegen anders aussehen als früher.
+
+| Bereich | 24.04 LTS | 26.04 LTS | Betrifft uns |
+|---------|-----------|-----------|--------------|
+| `sudo` | sudo 1.9.x | **sudo-rs** als Standard-Anbieter | ja, siehe unten |
+| coreutils | GNU | **uutils** (Rust), `cp`/`mv`/`rm` bleiben GNU | nein |
+| OpenSSH | 9.6 | 10.2, DSA entfernt | nein, wir nutzen kein DSA |
+| sshd-Start | socket-aktiviert | socket-aktiviert | ja, Unit-Ordnung |
+| cloud-init | einzelnes Paket | Metapaket + `cloud-init-base` | nein |
+| PHP (Nextcloud) | 8.3 | 8.5 | ja, getrennte Deploy-Scripts |
+
+### sudo-rs — die eine wirklich brechende Änderung
+
+Ab 26.04 ist `sudo-rs` der Standard-Anbieter von `/usr/bin/sudo`. Beide
+Pakete sind installiert, `/usr/bin/sudo` ist ein `update-alternatives`-Link,
+und sudo-rs gewinnt über die höhere Priorität.
+
+```bash
+# Wer gerade bedient wird
+update-alternatives --display sudo
+sudo --version
+```
+
+**Sein Parser kennt keine Anführungszeichen um Benutzer- und Gruppennamen.**
+Er akzeptiert `@` mitten im Namen, ein führendes `"` ist dagegen ein
+Syntaxfehler. Und eine ungültige Datei in `/etc/sudoers.d` macht `sudo`
+systemweit unbrauchbar — auf einem AD-gebundenen Server heisst das: niemand
+kommt mehr an Root.
+
+| Schreibweise | sudo 1.9.x | sudo-rs |
+|--------------|------------|---------|
+| `%G_server-admin@domain ALL=(ALL) ALL` | funktioniert | funktioniert |
+| `"%G_server-admin@domain" ALL=(ALL) ALL` | funktioniert | **Syntaxfehler** |
+| `%G_server-admin\@domain ALL=(ALL) ALL` | funktioniert | **Syntaxfehler** |
+| `%domain\ admins@domain ALL=(ALL) ALL` | funktioniert | funktioniert |
+
+Die Scripts schreiben deshalb die unquotierte Form und escapen nur
+Leerzeichen. sudo-rs kennt als Escape-Sequenzen ausschliesslich
+`\\ \" \, \: \= \! \( \)` und das Leerzeichen — `\@` gehört nicht dazu.
+
+Nach jeder Änderung an einer sudoers-Datei validieren. Das ist keine Kür:
+```bash
+sudo visudo -c -f /etc/sudoers.d/ad-admins
+```
+
+**Weitere Unterschiede von sudo-rs**, die in anderen Setups stören können:
+
+- Kein `sudoers.ldap`. Sudo-Regeln aus LDAP oder AD funktionieren nicht.
+  Wir sind nicht betroffen, weil die Regel lokal in `/etc/sudoers.d` steht.
+- Kein I/O-Logging, kein `sudoreplay`. Wer Sitzungsmitschnitte braucht,
+  muss auf das Original zurück.
+- Platzhalter in Kommando-Argumenten werden nicht mehr gematcht. Regeln,
+  die darauf bauen, greifen still nicht mehr.
+- `sudo -E` fehlt, ebenso einige `Defaults`-Optionen.
+
+**Zurück auf das Original**, falls etwas davon im Weg steht:
+```bash
+sudo update-alternatives --set sudo /usr/bin/sudo.ws
+```
+
+### uutils coreutils
+
+26.04 ersetzt rund achtzig Basiswerkzeuge durch Rust-Implementierungen;
+`cp`, `mv` und `rm` bleiben vorerst GNU. Die Neuimplementierungen zielen auf
+Verhaltensgleichheit, Abweichungen gelten als Fehler.
+
+Die Scripts benutzen nur gebräuchliche Optionen. Eine Stelle wurde
+trotzdem vorsorglich entschärft: `firstboot.sh` schreibt den Zeitstempel im
+Marker mit einem expliziten `date '+%Y-%m-%dT%H:%M:%S%z'` statt mit
+`date -Is`.
+
+### OpenSSH mit Socket-Aktivierung
+
+Auf beiden Releases lauscht `ssh.socket`, nicht `ssh.service`. Zwei
+Konsequenzen, beide in den Scripts berücksichtigt:
+
+- `ssh-host-keys.service` hat `Before=ssh.socket ssh.service sshd.service`.
+  Die Host Keys braucht die pro Verbindung gestartete Instanz.
+- Zum Anwenden der `sshd_config` gilt `systemctl try-reload-or-restart ssh`.
+  Bei inaktiver `ssh.service` ist das ein No-op, und das ist richtig: jede
+  neue Verbindung liest die Konfiguration ohnehin frisch ein.
+
+### Pakete
+
+Alle von den Scripts installierten Pakete existieren in 26.04 unverändert
+unter demselben Namen. Drei liegen in **universe**: `oddjob`,
+`oddjob-mkhomedir` und `krb5-user`. Auf einer Server-Installation ist
+universe standardmässig aktiv. Bei einem minimalen Container-Image mit nur
+`main` scheitert die Installation genau an diesen dreien.
+
+`cloud-init` ist in 26.04 ein Metapaket, die Implementierung steckt in
+`cloud-init-base`. Für `apt-get install cloud-init` ändert sich nichts,
+wohl aber für ein `apt purge cloud-init` — das entfernt die Implementierung
+nicht mehr mit.
+
+### Was die Scripts selbst prüfen
+
+`prepare-template.sh` liest `VERSION_ID` aus `/etc/os-release`, zeigt das
+Release im Kopf an und fragt nach, wenn es weder 24.04 noch 26.04 ist. Die
+beiden Nextcloud-Deploys brechen ab, wenn sie auf dem falschen Release
+laufen, statt auf halber Strecke an fehlenden PHP-Paketen zu scheitern.

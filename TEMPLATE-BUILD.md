@@ -1,6 +1,6 @@
 # Ubuntu Template bauen und ausrollen
 
-*Arbeitsanleitung · Ubuntu 24.04 LTS · VMware vSphere · Vita Brevis*
+*Arbeitsanleitung · Ubuntu 26.04.1 LTS · VMware vSphere · Vita Brevis*
 
 Diese Anleitung beschreibt den kompletten Weg vom leeren ISO bis zur
 fertig gejointen VM — ausschliesslich über die Scripts aus dem Repository
@@ -10,6 +10,13 @@ im README des Repos.
 
 Zeitbedarf beim ersten Mal: rund 90 Minuten. Bei einem Template-Update: rund
 20 Minuten.
+
+> **Ubuntu 26.04 statt 24.04.** Die Scripts laufen auf beiden Releases. In
+> 26.04 ist `sudo-rs` der Standard statt sudo 1.9, und die Basiswerkzeuge
+> kommen von uutils statt von GNU. Praktisch betrifft das nur eine Stelle:
+> Gruppennamen in `sudoers`-Dateien dürfen **nicht** in Anführungszeichen
+> stehen. Die Scripts schreiben das korrekt, wer von Hand nachträgt, muss es
+> wissen. Details im README unter Part 10.
 
 ---
 
@@ -127,7 +134,7 @@ Diese Werte fragt `prepare-template.sh` ab. Vorher zusammentragen:
 | RAM | 4 GB |
 | Disk | 40 GB, Thin Provision |
 | Netzwerk | Portgruppe mit Sicht auf die Domain Controller |
-| VM-Name | sprechend und eindeutig, zum Beispiel `ubuntu-2404-tpl` |
+| VM-Name | sprechend und eindeutig, zum Beispiel `ubuntu-2604-tpl` |
 
 > **Der VM-Name wird zum Hostnamen und damit zum Schutzmechanismus.** Der
 > Firstboot-Dienst vergleicht den Hostnamen eines Klons mit dem des Templates.
@@ -136,7 +143,7 @@ Diese Werte fragt `prepare-template.sh` ab. Vorher zusammentragen:
 
 ### 1.2 Ubuntu installieren
 
-Ubuntu Server 24.04 LTS, minimale Installation, kein Desktop.
+Ubuntu Server 26.04.1 LTS, minimale Installation, kein Desktop.
 
 | Schritt | Auswahl |
 |---------|---------|
@@ -154,7 +161,7 @@ Ubuntu Server 24.04 LTS, minimale Installation, kein Desktop.
 Falls der Installer einen anderen Namen gesetzt hat:
 
 ```bash
-sudo hostnamectl set-hostname ubuntu-2404-tpl
+sudo hostnamectl set-hostname ubuntu-2604-tpl
 ```
 
 ---
@@ -241,18 +248,28 @@ ls /etc/krb5.keytab 2>/dev/null                  # → darf nicht existieren
 # SSH-Konfiguration gültig?
 sudo sshd -t && echo OK
 
+# Sudo-Regel für die AD-Gruppe gültig? (auf 26.04 prüft das sudo-rs)
+sudo visudo -c -f /etc/sudoers.d/ad-admins
+cat /etc/sudoers.d/ad-admins      # Gruppenname ohne Anführungszeichen
+
 # Netzwerk-Fallback vorhanden?
 ls -l /etc/netplan/99-fallback-dhcp.yaml
 
 # SNMP antwortet lokal?
-snmpget -v 2c -c <community> 127.0.0.1 sysDescr.0
+snmpget -v 2c -c <community> 127.0.0.1 .1.3.6.1.2.1.1.1.0
 ```
 
 Zusätzlich vom Monitoring-Host aus:
 
 ```bash
-snmpwalk -v 2c -c <community> <template-ip> system
+snmpwalk -v 2c -c <community> <template-ip> .1.3.6.1.2.1.1
 ```
+
+> **Warum numerische OIDs?** Die textuellen MIB-Dateien stecken in
+> `snmp-mibs-downloader` aus dem multiverse-Repository und fehlen auf einem
+> Standard-Ubuntu. Mit `sysDescr.0` antwortet `snmpget` dann *Unknown Object
+> Identifier*, obwohl snmpd einwandfrei läuft. Numerische OIDs brauchen
+> keine MIBs.
 
 ---
 
@@ -328,7 +345,7 @@ Rechtsklick auf die VM → Template → Convert to Template
 ```
 
 Das Template sinnvoll benennen und ablegen, zum Beispiel
-`ubuntu-2404-tpl-2026-09` in einem Ordner `Templates`.
+`ubuntu-2604-tpl-2026-09` in einem Ordner `Templates`.
 
 ---
 
@@ -527,8 +544,10 @@ sudo journalctl -u vb-firstboot -n 50
 | Firstboot lief gar nicht | Marker war beim Versiegeln noch da | Im Template löschen, neu versiegeln |
 | `join.secret` fehlt auf dem Klon | Normal nach erfolgreichem Join | `post-clone.sh --force` fragt das Passwort ab |
 | Kein Auto-Join trotz Absicht | Beim Bau kein Passwort angegeben | `ENABLE_JOIN` in `firstboot.conf` prüfen, Secret nachtragen |
-| AD-User fehlt `sudo` | Gruppenname mit `@` nicht gequotet | `/etc/sudoers.d/ad-admins` prüfen |
+| AD-User fehlt `sudo` | Gruppenname falsch geschrieben | `/etc/sudoers.d/ad-admins` prüfen, unquotiert schreiben |
+| `sudo` streikt nach Änderung an `sudoers.d` | Datei parst unter sudo-rs nicht | Aus Root-Shell entfernen, unquotiert neu schreiben, `visudo -c -f` |
 | SSH verweigert AD-Login | Gruppe fehlt in `AllowGroups` | `/etc/ssh/sshd_config.d/99-vita-brevis.conf` prüfen |
+| SNMP: `Unknown Object Identifier` | MIB-Dateien nicht installiert | Numerische OID verwenden |
 | Boot hängt bei networkd | `networkd-wait-online` nicht maskiert | Siehe Teil 2.3, Schritt 7 |
 
 ---

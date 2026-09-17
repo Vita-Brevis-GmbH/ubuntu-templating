@@ -187,7 +187,7 @@ if [[ "${ENABLE_JOIN,,}" != "yes" ]]; then
     log "── [4/8] Domain Join deaktiviert (ENABLE_JOIN=${ENABLE_JOIN}) — uebersprungen."
     mkdir -p "$STATE_DIR"
     {
-        echo "firstboot:  $(date -Is)"
+        echo "firstboot:  $(date '+%Y-%m-%dT%H:%M:%S%z')"
         echo "hostname:   $(hostname -f 2>/dev/null || hostname)"
         echo "domainjoin: uebersprungen"
     } > "$MARKER"
@@ -388,7 +388,7 @@ fi
 
 mkdir -p "$STATE_DIR"
 {
-    echo "firstboot:  $(date -Is)"
+    echo "firstboot:  $(date '+%Y-%m-%dT%H:%M:%S%z')"
     echo "hostname:   $(hostname -f 2>/dev/null || hostname)"
     echo "domain:     ${AD_DOMAIN}"
     echo "join-user:  ${JOIN_USER}"

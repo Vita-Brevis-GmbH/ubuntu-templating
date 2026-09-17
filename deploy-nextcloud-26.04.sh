@@ -191,6 +191,29 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# ── Release-Check ───────────────────────────────────────────────
+# PHP_VER oben ist auf die Version dieser Ubuntu-Basis abgestimmt.
+# Auf 24.04 gibt es kein php8.5 — dort gehoert deploy-nextcloud.sh hin.
+# Eine neuere Basis ist kein harter Fehler, dort muss aber PHP_VER passen.
+_RELEASE="$( [[ -r /etc/os-release ]] && . /etc/os-release && echo "${VERSION_ID:-unbekannt}" )"
+if [[ "${_RELEASE}" == "24.04" ]]; then
+    echo "Fehler: Auf Ubuntu 24.04 LTS gibt es keine php${PHP_VER}-Pakete."
+    echo "        Stattdessen './deploy-nextcloud.sh' verwenden (PHP 8.3)."
+    exit 1
+fi
+if [[ "${_RELEASE}" != "26.04" ]]; then
+    echo ""
+    echo "  WARNUNG: Dieses Script ist auf Ubuntu 26.04 LTS abgestimmt."
+    echo "  Gefunden: Ubuntu ${_RELEASE}, eingestellte PHP-Version: ${PHP_VER}"
+    echo "  Passt PHP_VER im Kopf des Scripts nicht, brechen die Paket-"
+    echo "  installationen spaeter ab."
+    read -rp "  Trotzdem fortfahren? (ja/nein): " _rel_confirm
+    if [[ "${_rel_confirm,,}" != "ja" ]]; then
+        echo "  Abgebrochen."
+        exit 1
+    fi
+fi
+
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  Deploy: Nextcloud Server (Ubuntu 26.04)                 ║"

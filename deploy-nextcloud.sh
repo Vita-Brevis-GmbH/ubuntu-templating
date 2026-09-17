@@ -182,6 +182,21 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# ── Release-Check ───────────────────────────────────────────────
+# Dieses Script installiert PHP 8.3 und ist damit an Ubuntu 24.04
+# gebunden. Ab 26.04 gibt es keine php8.3-Pakete mehr — dort gehoert
+# deploy-nextcloud-26.04.sh hin. Frueh abbrechen ist besser, als auf
+# halber Strecke an fehlenden Paketen zu scheitern.
+_RELEASE="$( [[ -r /etc/os-release ]] && . /etc/os-release && echo "${VERSION_ID:-unbekannt}" )"
+if [[ "${_RELEASE}" != "24.04" ]]; then
+    echo "Fehler: Dieses Script ist fuer Ubuntu 24.04 LTS (PHP 8.3)."
+    echo "        Gefunden: Ubuntu ${_RELEASE}"
+    if [[ "${_RELEASE}" == "26.04" ]]; then
+        echo "        Fuer 26.04 stattdessen './deploy-nextcloud-26.04.sh' verwenden."
+    fi
+    exit 1
+fi
+
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  Deploy: Nextcloud Server                                ║"

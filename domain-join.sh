@@ -2,8 +2,9 @@
 # ─────────────────────────────────────────────────────────────────
 #  domain-join.sh
 #  Standalone-Script fuer Active Directory Domain Join auf einem
-#  Ubuntu-24.04-System — installiert und konfiguriert SSSD/Kerberos,
-#  joint die Domain und verifiziert das Ergebnis mit einem Test-User.
+#  Ubuntu-LTS-System (26.04 / 24.04) — installiert und konfiguriert
+#  SSSD/Kerberos, joint die Domain und verifiziert das Ergebnis mit
+#  einem Test-User.
 #
 #  Ablauf:
 #    1. Pakete installieren (SSSD-Stack, realmd, krb5-user)
@@ -186,15 +187,28 @@ chmod 600 /etc/sssd/sssd.conf
 echo "    /etc/sssd/sssd.conf geschrieben (chmod 600)."
 
 # Sudo fuer AD-Admin-Gruppe
+#
+# Schreibweise: unquoted, Leerzeichen mit Backslash escaped — die einzige
+# Form, die sowohl sudo 1.9.x (Ubuntu 24.04) als auch sudo-rs (Standard ab
+# Ubuntu 26.04) akzeptieren. sudo-rs kennt keine Anfuehrungszeichen um
+# Gruppennamen und auch '\@' nicht.
+AD_ADMIN_GROUP_SUDO="${AD_ADMIN_GROUP// /\\ }"
+
 cat > /etc/sudoers.d/ad-admins <<EOF
 # Sudo fuer AD-Gruppe '${AD_ADMIN_GROUP}' erlauben
-# Gruppenname in doppelte Anführungszeichen: modernes sudo (1.9.x) lehnt
-# den frueher ueblichen Backslash-Escape '\@' als "illegal escape sequence"
-# ab. Quoting deckt sowohl '@' als auch Leerzeichen im Gruppennamen ab.
-"%${AD_ADMIN_GROUP}@${AD_DOMAIN}" ALL=(ALL) ALL
+# Generiert von domain-join.sh — nicht manuell bearbeiten.
+%${AD_ADMIN_GROUP_SUDO}@${AD_DOMAIN} ALL=(ALL) ALL
 EOF
 chmod 440 /etc/sudoers.d/ad-admins
-visudo -c -f /etc/sudoers.d/ad-admins
+
+# Eine ungueltige Datei in /etc/sudoers.d macht sudo systemweit
+# unbrauchbar — deshalb abbrechen statt weiterlaufen.
+if ! visudo -c -f /etc/sudoers.d/ad-admins; then
+    rm -f /etc/sudoers.d/ad-admins
+    echo "    FEHLER: sudoers-Regel ungueltig — Datei wurde wieder entfernt."
+    echo "    Gruppenname pruefen: '${AD_ADMIN_GROUP}'"
+    exit 1
+fi
 echo "    /etc/sudoers.d/ad-admins geschrieben und validiert."
 
 # Automatische Home-Verzeichnisse via PAM

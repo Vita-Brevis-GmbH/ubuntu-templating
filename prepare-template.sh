@@ -1,8 +1,8 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────
 #  prepare-template.sh
-#  Automatisiert die Vorbereitung einer Ubuntu 24.04 LTS VM
-#  als VMware Template (Parts 1-6 aus vmware-template-guide.md)
+#  Automatisiert die Vorbereitung einer Ubuntu LTS VM als VMware
+#  Template. Getestet auf Ubuntu 26.04 LTS und 24.04 LTS.
 #
 #  Verwendung: sudo ./prepare-template.sh
 # ─────────────────────────────────────────────────────────────────
@@ -66,6 +66,30 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# ── Ubuntu-Release ermitteln ───────────────────────────────────
+# Das Script ist auf 24.04 LTS und 26.04 LTS getestet. Auf 26.04 sind
+# sudo-rs und uutils-coreutils Standard; die Scripts sind darauf
+# ausgelegt, aber ein unbekanntes Release soll bewusst auffallen.
+UBUNTU_RELEASE="unbekannt"
+if [[ -r /etc/os-release ]]; then
+    UBUNTU_RELEASE="$(. /etc/os-release && echo "${VERSION_ID:-unbekannt}")"
+fi
+
+case "${UBUNTU_RELEASE}" in
+    24.04|26.04)
+        : ;;
+    *)
+        echo ""
+        echo "  WARNUNG: Ubuntu ${UBUNTU_RELEASE} ist mit diesen Scripts nicht getestet."
+        echo "  Getestet sind 24.04 LTS und 26.04 LTS."
+        read -rp "  Trotzdem fortfahren? (ja/nein): " _rel_confirm
+        if [[ "${_rel_confirm,,}" != "ja" ]]; then
+            echo "  Abgebrochen."
+            exit 1
+        fi
+        ;;
+esac
+
 # ── Mitgelieferte Dateien pruefen ──────────────────────────────
 for _required in firstboot.sh vb-firstboot.service; do
     if [[ ! -f "${SCRIPT_DIR}/${_required}" ]]; then
@@ -78,7 +102,7 @@ done
 # ── Interaktive Konfiguration ──────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  VMware Template Preparation - Ubuntu 24.04 LTS        ║"
+printf "║  VMware Template Preparation - Ubuntu %-19s║\n" "${UBUNTU_RELEASE} LTS"
 echo "║  Konfiguration                                          ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
@@ -267,7 +291,13 @@ log "SSH Host-Key Service einrichten"
 cat > /etc/systemd/system/ssh-host-keys.service <<'EOF'
 [Unit]
 Description=Generate SSH host keys if missing
-Before=ssh.service sshd.service
+# ssh.socket muss mit aufgefuehrt sein: seit Ubuntu 22.10 ist sshd
+# socket-aktiviert. Die Host Keys braucht dann die pro Verbindung
+# gestartete Instanz, nicht ssh.service — ohne diese Ordnung koennte
+# die erste Verbindung vor der Key-Erzeugung eintreffen.
+# Nicht existierende Units in Before= sind wirkungslos, die Zeile ist
+# also auf beiden Varianten korrekt.
+Before=ssh.socket ssh.service sshd.service
 ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
 
 [Service]
@@ -290,9 +320,19 @@ echo "    Part 3 abgeschlossen."
 # ================================================================
 log "SSH Hardening konfigurieren"
 
-# Als Drop-in statt als Aenderung an sshd_config: Ubuntu 24.04 zieht
+# Als Drop-in statt als Aenderung an sshd_config: Ubuntu zieht
 # /etc/ssh/sshd_config.d/*.conf ganz oben ein, damit gewinnen unsere
 # Werte und ein Distributions-Update kann die Datei nicht ueberschreiben.
+#
+# AllowGroups trennt seine Muster an Leerzeichen. Ein Gruppenname mit
+# Leerzeichen ("Domain Admins") zerfiele unquotiert still in zwei Muster
+# — 'sshd -t' meldet das NICHT, die Regel waere aber falsch. Deshalb das
+# ganze Muster quoten, sobald ein Leerzeichen vorkommt.
+AD_SSH_PATTERN="${AD_ADMIN_GROUP}@${AD_DOMAIN}"
+if [[ "${AD_SSH_PATTERN}" == *" "* ]]; then
+    AD_SSH_PATTERN="\"${AD_SSH_PATTERN}\""
+fi
+
 cat > /etc/ssh/sshd_config.d/99-vita-brevis.conf <<EOF
 # Managed by prepare-template.sh — nicht manuell bearbeiten
 
@@ -314,14 +354,18 @@ ClientAliveCountMax 2
 # Zugang auf die AD-Admin-Gruppe und lokale Admins beschraenken.
 # 'sudo' deckt den Break-Glass-User ab und bleibt erreichbar, solange
 # die Domain nicht verfuegbar ist.
-AllowGroups sudo ${DEFAULT_USER} ${AD_ADMIN_GROUP}@${AD_DOMAIN}
+AllowGroups sudo ${DEFAULT_USER} ${AD_SSH_PATTERN}
 EOF
 chmod 644 /etc/ssh/sshd_config.d/99-vita-brevis.conf
 
 # Erst validieren, dann aktivieren — eine kaputte sshd_config wuerde
 # die laufende Session beim naechsten Reconnect aussperren.
 if sshd -t 2>/dev/null; then
-    systemctl reload ssh 2>/dev/null || systemctl restart ssh
+    # try-reload-or-restart wirkt nur auf eine aktive Unit. Bei
+    # socket-aktiviertem sshd (Ubuntu 22.10+) ist ssh.service inaktiv und
+    # der Befehl ist ein No-op — richtig so, denn dort liest jede neue
+    # Verbindung die Konfiguration ohnehin frisch ein.
+    systemctl try-reload-or-restart ssh 2>/dev/null || true
     echo "    /etc/ssh/sshd_config.d/99-vita-brevis.conf aktiv."
 else
     rm -f /etc/ssh/sshd_config.d/99-vita-brevis.conf
@@ -460,15 +504,34 @@ echo "    /etc/sssd/sssd.conf geschrieben (chmod 600)."
 pam-auth-update --enable mkhomedir
 
 # Sudo fuer AD-Gruppe
+#
+# Schreibweise: unquoted, Leerzeichen mit Backslash escaped.
+# Das ist die einzige Form, die beide Parser akzeptieren:
+#   - sudo 1.9.x (Ubuntu 24.04) nimmt sie ebenso wie die frueher hier
+#     verwendete Variante in doppelten Anfuehrungszeichen.
+#   - sudo-rs (Standard ab Ubuntu 26.04) kennt KEINE Anfuehrungszeichen
+#     um Benutzer- und Gruppennamen. Sein Lexer akzeptiert '@' mitten im
+#     Namen, ein fuehrendes '"' dagegen nicht — die gequotete Variante
+#     waere dort ein Syntaxfehler und die ganze Datei ungueltig.
+# '\@' ist ebenfalls raus: sudo-rs kennt nur \\ \" \, \: \= \! \( \) und
+# das Leerzeichen als Escape-Sequenz.
+AD_ADMIN_GROUP_SUDO="${AD_ADMIN_GROUP// /\\ }"
+
 cat > /etc/sudoers.d/ad-admins <<EOF
 # Sudo fuer AD-Gruppe '${AD_ADMIN_GROUP}' erlauben
-# Gruppenname in doppelte Anführungszeichen: modernes sudo (1.9.x) lehnt
-# den frueher ueblichen Backslash-Escape '\@' als "illegal escape sequence"
-# ab. Quoting deckt sowohl '@' als auch Leerzeichen im Gruppennamen ab.
-"%${AD_ADMIN_GROUP}@${AD_DOMAIN}" ALL=(ALL) ALL
+# Generiert von prepare-template.sh — nicht manuell bearbeiten.
+%${AD_ADMIN_GROUP_SUDO}@${AD_DOMAIN} ALL=(ALL) ALL
 EOF
 chmod 440 /etc/sudoers.d/ad-admins
-visudo -c -f /etc/sudoers.d/ad-admins
+
+# Validieren. Eine ungueltige Datei in /etc/sudoers.d macht sudo
+# systemweit unbrauchbar — deshalb hier abbrechen statt weiterlaufen.
+if ! visudo -c -f /etc/sudoers.d/ad-admins; then
+    rm -f /etc/sudoers.d/ad-admins
+    echo "    FEHLER: sudoers-Regel ungueltig — Datei wurde wieder entfernt."
+    echo "    Gruppenname pruefen: '${AD_ADMIN_GROUP}'"
+    exit 1
+fi
 echo "    /etc/sudoers.d/ad-admins geschrieben und validiert."
 
 # SSSD & Domain-Mitgliedschaft bereinigen (Template darf nicht joined sein)
@@ -550,18 +613,23 @@ EOF
 chmod 600 /etc/snmp/snmpd.conf
 echo "    /etc/snmp/snmpd.conf geschrieben."
 
-# snmpd nicht via Default-Args /etc/default/snmpd auf 127.0.0.1 binden
-# lassen — agentAddress aus snmpd.conf gilt.
-if [[ -f /etc/default/snmpd ]]; then
-    sed -i 's|^SNMPDOPTS=.*|SNMPDOPTS="-Lsd -Lf /dev/null -u Debian-snmp -g Debian-snmp -I -smux mteTrigger mteTriggerConf -p /run/snmpd.pid"|' /etc/default/snmpd
-fi
+# Hinweis: /etc/default/snmpd wird bewusst NICHT angefasst. Die
+# systemd-Unit von snmpd hat kein EnvironmentFile und baut ihre
+# Kommandozeile fest zusammen — SNMPDOPTS aus /etc/default/snmpd wird
+# also gar nicht gelesen. Die Lauschadresse kommt aus 'agentAddress' in
+# der snmpd.conf oben, und die gilt unabhaengig davon.
 
 systemctl enable snmpd
 systemctl restart snmpd
 
-# Quick-Sanity-Check (lokal)
+# Quick-Sanity-Check (lokal).
+# Numerische OID statt 'sysDescr.0': die textuellen MIB-Dateien stecken
+# in 'snmp-mibs-downloader' (multiverse) und fehlen auf einem Standard-
+# Ubuntu. Mit einem symbolischen Namen wuerde der Check deshalb immer
+# scheitern und eine Warnung ausgeben, obwohl snmpd laeuft.
+# .1.3.6.1.2.1.1.1.0 ist sysDescr.0 in numerischer Form.
 sleep 1
-if snmpget -v 2c -c "${SNMP_COMMUNITY}" -t 2 -r 1 127.0.0.1 sysDescr.0 >/dev/null 2>&1; then
+if snmpget -v 2c -c "${SNMP_COMMUNITY}" -t 2 -r 1 127.0.0.1 .1.3.6.1.2.1.1.1.0 >/dev/null 2>&1; then
     echo "    snmpd antwortet lokal — OK."
 else
     echo "    Warnung: snmpd antwortet (noch) nicht — Status pruefen mit: systemctl status snmpd"
@@ -666,7 +734,7 @@ fi
 echo ""
 echo "  Naechste Schritte:"
 echo "    1. SNMP-Erreichbarkeit vom Monitoring-Host testen:"
-echo "         snmpwalk -v 2c -c <community> <host> system"
+echo "         snmpwalk -v 2c -c <community> <host> .1.3.6.1.2.1.1"
 echo "    2. Break-Glass-Passwort setzen und versiegeln:"
 echo "         sudo ./seal-template.sh"
 echo "    3. VM herunterfahren: sudo shutdown -h now"
