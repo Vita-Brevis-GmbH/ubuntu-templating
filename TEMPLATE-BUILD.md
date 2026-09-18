@@ -648,7 +648,8 @@ sudo journalctl -u vb-firstboot -n 50
 | Boot hängt trotz Maskierung (26.04) | netplan 1.2 wartet auf routbare Adresse und DNS | `optional: true` im Netplan-Fallback ergänzen |
 | Log: „cloud-init nicht sauber abgeschlossen" | Exit-Code 2 bedeutet behebbarer Fehler, nicht Abbruch | `cloud-init status --long` ansehen, Firstboot läuft trotzdem weiter |
 | Erste SSH-Verbindung: `no host keys available` | Host Keys wurden nach dem Klonen nicht erzeugt | `systemctl status ssh-host-keys.service`, notfalls `ssh-keygen -A` |
-| `systemctl reload ssh` schlägt fehl | Bei Socket-Aktivierung ist `ssh.service` inaktiv | Nicht nötig, jede neue Verbindung liest die Konfiguration frisch |
+| `systemctl reload ssh` schlägt fehl | `ssh.service` läuft noch nicht, nur `ssh.socket` | Unkritisch, die erste Verbindung startet sshd mit der neuen Konfiguration |
+| Änderung an `sshd_config.d` wirkt nicht | Der laufende `sshd -D` liest sie nur beim Start | `sudo systemctl reload ssh`, Socket-Aktivierung ändert daran nichts |
 
 ---
 

@@ -236,11 +236,22 @@ AllowGroups sudo localadmin G_server-admin@int.vitabrevis.ch
 sudo sshd -t && sudo systemctl try-reload-or-restart ssh
 ```
 
-> **Hinweis:** `try-reload-or-restart` wirkt nur auf eine aktive Unit. Bei
-> socket-aktiviertem sshd ist `ssh.service` inaktiv und der Befehl ein
-> No-op. Das ist richtig so: dort liest jede neue Verbindung die
-> Konfiguration ohnehin frisch ein. Ein `systemctl restart ssh` wäre an
-> dieser Stelle falsch, es würde den Dauer-Daemon neben dem Socket starten.
+> ⚠️ **Eine Konfigurationsänderung braucht ein Reload — auch bei
+> Socket-Aktivierung.** Das wird gern falsch verstanden. `ssh.socket` hat
+> `Accept=no`, systemd bindet also nur den Port und übergibt den lauschenden
+> Socket an **einen** dauerhaft laufenden `sshd -D` aus `ssh.service`. Der
+> liest `sshd_config` genau einmal beim Start. Nur mit `Accept=yes` würde je
+> Verbindung ein eigener Prozess starten und die Konfiguration neu lesen.
+>
+> `try-reload-or-restart` trifft beide Fälle richtig: Läuft der Daemon
+> bereits, bekommt er SIGHUP. Läuft er noch nicht, passiert nichts, und die
+> erste Verbindung startet ihn mit der neuen Konfiguration.
+>
+> Nach einer Änderung an `Port` oder `ListenAddress` reicht das nicht. Dann
+> muss zusätzlich der Socket neu erzeugt werden:
+> ```bash
+> sudo systemctl daemon-reload && sudo systemctl restart ssh.socket
+> ```
 
 > **Hinweis:** `AllowGroups` enthält neben der AD-Gruppe auch `sudo` und
 > `localadmin`. Damit bleibt der Break-Glass-Zugang offen, solange die Domain

@@ -444,7 +444,15 @@ if [[ "$VERIFY_OK" == "yes" && "$CANON_GROUP" != "$TYPED_GROUP" ]]; then
             "$SSHD_DROPIN" > "$_tmp"
         cat "$_tmp" > "$SSHD_DROPIN"
         if sshd -t 2>/dev/null; then
-            log "        AllowGroups auf '${CANON_GROUP}' korrigiert."
+            # Ohne Reload bliebe die Korrektur bis zum naechsten Boot
+            # wirkungslos: 'ssh.socket' hat 'Accept=no', systemd uebergibt
+            # den Port also an EINEN dauerhaft laufenden 'sshd -D', und der
+            # liest die Konfiguration nur beim Start.
+            # 'try-reload-or-restart' passt fuer beide Faelle — laeuft der
+            # Daemon noch nicht, startet ihn die erste Verbindung ohnehin
+            # mit der neuen Konfiguration.
+            systemctl try-reload-or-restart ssh >/dev/null 2>&1 || true
+            log "        AllowGroups auf '${CANON_GROUP}' korrigiert, sshd neu geladen."
         else
             cat "$_tmp.bak" > "$SSHD_DROPIN"
             warn "Korrigierte sshd-Konfiguration war ungueltig — Original wiederhergestellt."

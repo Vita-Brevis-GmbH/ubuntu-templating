@@ -399,10 +399,14 @@ chmod 644 /etc/ssh/sshd_config.d/99-vita-brevis.conf
 # Erst validieren, dann aktivieren — eine kaputte sshd_config wuerde
 # die laufende Session beim naechsten Reconnect aussperren.
 if sshd -t 2>/dev/null; then
-    # try-reload-or-restart wirkt nur auf eine aktive Unit. Bei
-    # socket-aktiviertem sshd (Ubuntu 22.10+) ist ssh.service inaktiv und
-    # der Befehl ist ein No-op — richtig so, denn dort liest jede neue
-    # Verbindung die Konfiguration ohnehin frisch ein.
+    # Zur Socket-Aktivierung: 'ssh.socket' hat 'Accept=no'. systemd bindet
+    # also nur den Port und uebergibt den lauschenden Socket an EINEN
+    # dauerhaft laufenden 'sshd -D' aus ssh.service. Der liest die
+    # Konfiguration genau einmal beim Start — eine Aenderung braucht
+    # deshalb sehr wohl ein Reload.
+    # 'try-reload-or-restart' trifft beides richtig: laeuft der Daemon
+    # schon, bekommt er SIGHUP; laeuft er noch nicht, passiert nichts,
+    # und die erste Verbindung startet ihn mit der neuen Konfiguration.
     systemctl try-reload-or-restart ssh 2>/dev/null || true
     echo "    /etc/ssh/sshd_config.d/99-vita-brevis.conf aktiv."
 else
