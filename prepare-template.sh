@@ -348,9 +348,27 @@ log "SSH Hardening konfigurieren"
 # Leerzeichen ("Domain Admins") zerfiele unquotiert still in zwei Muster
 # — 'sshd -t' meldet das NICHT, die Regel waere aber falsch. Deshalb das
 # ganze Muster quoten, sobald ein Leerzeichen vorkommt.
-AD_SSH_PATTERN="${AD_ADMIN_GROUP}@${AD_DOMAIN}"
-if [[ "${AD_SSH_PATTERN}" == *" "* ]]; then
-    AD_SSH_PATTERN="\"${AD_SSH_PATTERN}\""
+ssh_pattern() {
+    local p="$1"
+    if [[ "$p" == *" "* ]]; then printf '"%s"' "$p"; else printf '%s' "$p"; fi
+}
+
+# Zur Schreibweise: sshd vergleicht Gruppennamen ZEICHENGENAU, SSSD
+# nicht. Beim AD-Provider ist 'case_sensitive = True' laut sssd.conf(5)
+# sogar ungueltig, der Default ist False — Namen kommen aus NSS also
+# kleingeschrieben zurueck, egal wie sie im Verzeichnis stehen.
+# Wer hier 'G_server-admin' eintippt, bekommt von 'getent group' brav
+# einen Treffer, waehrend sshd denselben Benutzer abweist, weil in
+# dessen Gruppenliste 'g_server-admin@domain' steht.
+# Deshalb die Kleinschreibung als Standard, die eingegebene Variante
+# zusaetzlich fuer den Fall 'case_sensitive = Preserving'.
+# vb-firstboot.sh zieht die Zeile nach dem Join ohnehin auf den
+# tatsaechlich gelieferten Namen nach.
+AD_GROUP_TYPED="${AD_ADMIN_GROUP}@${AD_DOMAIN}"
+AD_GROUP_LOWER="${AD_GROUP_TYPED,,}"
+AD_SSH_PATTERN="$(ssh_pattern "${AD_GROUP_LOWER}")"
+if [[ "${AD_GROUP_TYPED}" != "${AD_GROUP_LOWER}" ]]; then
+    AD_SSH_PATTERN="${AD_SSH_PATTERN} $(ssh_pattern "${AD_GROUP_TYPED}")"
 fi
 
 cat > /etc/ssh/sshd_config.d/99-vita-brevis.conf <<EOF
@@ -381,10 +399,14 @@ chmod 644 /etc/ssh/sshd_config.d/99-vita-brevis.conf
 # Erst validieren, dann aktivieren — eine kaputte sshd_config wuerde
 # die laufende Session beim naechsten Reconnect aussperren.
 if sshd -t 2>/dev/null; then
-    # try-reload-or-restart wirkt nur auf eine aktive Unit. Bei
-    # socket-aktiviertem sshd (Ubuntu 22.10+) ist ssh.service inaktiv und
-    # der Befehl ist ein No-op — richtig so, denn dort liest jede neue
-    # Verbindung die Konfiguration ohnehin frisch ein.
+    # Zur Socket-Aktivierung: 'ssh.socket' hat 'Accept=no'. systemd bindet
+    # also nur den Port und uebergibt den lauschenden Socket an EINEN
+    # dauerhaft laufenden 'sshd -D' aus ssh.service. Der liest die
+    # Konfiguration genau einmal beim Start — eine Aenderung braucht
+    # deshalb sehr wohl ein Reload.
+    # 'try-reload-or-restart' trifft beides richtig: laeuft der Daemon
+    # schon, bekommt er SIGHUP; laeuft er noch nicht, passiert nichts,
+    # und die erste Verbindung startet ihn mit der neuen Konfiguration.
     systemctl try-reload-or-restart ssh 2>/dev/null || true
     echo "    /etc/ssh/sshd_config.d/99-vita-brevis.conf aktiv."
 else
@@ -500,7 +522,13 @@ cat > /etc/sssd/sssd.conf <<EOF
 [sssd]
 domains = ${AD_DOMAIN}
 config_file_version = 2
-services = nss, pam, sudo
+# Bewusst KEINE 'services'-Zeile. Auf systemd-Systemen ist sie laut
+# sssd.conf(5) optional, weil die Responder per Socket aktiviert werden.
+# Steht ein Responder hier drin, startet der SSSD-Monitor ihn selbst und
+# belegt dessen Socket. Die gleichnamige systemd-Unit scheitert dann in
+# ihrem ExecStartPre (sssd_check_socket_activated_responders) und meldet
+# beim Booten 'Failed to listen on sssd-<name>.socket'. Funktional
+# harmlos, aber es sieht nach einem kaputten Join aus.
 
 [domain/${AD_DOMAIN}]
 default_shell = /bin/bash
@@ -560,6 +588,25 @@ rm -f /etc/krb5.keytab
 
 systemctl disable sssd 2>/dev/null || true
 systemctl stop sssd 2>/dev/null || true
+
+# Responder-Sockets. Ohne 'services'-Zeile in der sssd.conf laufen die
+# Responder ausschliesslich ueber Socket-Aktivierung, also muessen die
+# Units aktiviert sein. Die Paketierung tut das zwar schon im postinst,
+# hier aber explizit — verlassen wollen wir uns darauf nicht.
+for _sock in sssd-nss sssd-pam sssd-sudo sssd-ssh sssd-autofs; do
+    systemctl enable "${_sock}.socket" 2>/dev/null || true
+done
+echo "    SSSD Responder-Sockets aktiviert."
+
+# sssd-pac.socket ist der Sonderfall. Sobald eine Domain
+# 'id_provider = ad' hat, haengt SSSD den PAC-Responder implizit an die
+# Service-Liste (confdb.c, add_implicit_services) — unabhaengig davon,
+# was in der sssd.conf steht. Der Monitor startet ihn dann selbst und
+# belegt den Socket, und die Unit scheitert bei jedem Boot.
+# Der Responder selbst bleibt aktiv, nur der redundante
+# Aktivierungsweg wird abgeschaltet.
+systemctl disable sssd-pac.socket 2>/dev/null || true
+echo "    sssd-pac.socket deaktiviert (PAC-Responder startet ueber den Monitor)."
 
 echo "    SSSD deaktiviert, Domain-Mitgliedschaft entfernt."
 echo "    Part 5 abgeschlossen."

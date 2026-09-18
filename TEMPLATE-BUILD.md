@@ -183,9 +183,14 @@ sudo hostnamectl set-hostname ubuntu-2604-tpl
 
 ```bash
 sudo apt update && sudo apt install -y git
-git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git
-cd ubuntu-templating
+sudo git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git /opt/ubuntu-templating
+cd /opt/ubuntu-templating
 ```
+
+> **Nach `/opt`, nicht ins Home des Build-Users.** `seal-template.sh` löscht
+> diesen Benutzer samt Home-Verzeichnis. Läge das Repository dort, wäre es
+> nach dem Versiegeln weg, und beim nächsten Template-Update müsste man es
+> neu klonen. Unter `/opt` überlebt es.
 
 > Das komplette Repository wird gebraucht, nicht nur ein einzelnes Script.
 > `prepare-template.sh` installiert `firstboot.sh` und `vb-firstboot.service`
@@ -330,7 +335,7 @@ openssl rand -base64 18
 ### 4.2 Versiegeln ausführen
 
 ```bash
-cd ~/ubuntu-templating
+cd /opt/ubuntu-templating
 sudo ./seal-template.sh
 ```
 
@@ -450,8 +455,8 @@ Ohne diese Parameter trägt die Beschreibung den FQDN, und die VM joint normal.
 Anmelden als `<benutzer>@int.vitabrevis.ch` oder als `localadmin`, dann:
 
 ```bash
-cd ~/ubuntu-templating 2>/dev/null || git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git ~/ubuntu-templating
-sudo ~/ubuntu-templating/post-clone.sh --status
+cd /opt/ubuntu-templating 2>/dev/null || sudo git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git /opt/ubuntu-templating
+sudo /opt/ubuntu-templating/post-clone.sh --status
 ```
 
 Das zeigt Hostname, Firstboot-Marker, Join-Status, SSSD-Status, die Auflösung
@@ -522,7 +527,7 @@ Alle paar Monate, damit neue VMs nicht mit hundert ausstehenden Updates starten.
 
    ```bash
    sudo apt update && sudo apt upgrade -y
-   cd ~/ubuntu-templating && git pull
+   cd /opt/ubuntu-templating && sudo git pull
    ```
 
 4. Bei Änderungen an den Scripts die Vorbereitung erneut laufen lassen,
@@ -629,17 +634,22 @@ sudo journalctl -u vb-firstboot -n 50
 | Join: „Already joined" und Keytab fehlt | Alte Mitgliedschaft aus dem Template | `realm leave`, `rm /etc/krb5.keytab`, dann `post-clone.sh --force` |
 | Kerberos schlägt fehl | Zeitabweichung über fünf Minuten | `timedatectl`, NTP prüfen |
 | Firstboot lief gar nicht | Marker war beim Versiegeln noch da | Im Template löschen, neu versiegeln |
+| Boot zeigt `Failed to listen on sssd-*.socket` | Responder steht in der `services`-Zeile der `sssd.conf` | Zeile entfernen, Responder kommen per Socket-Aktivierung |
+| Nur `sssd-pac.socket` scheitert | Bei `id_provider = ad` startet der Monitor den PAC-Responder implizit | `systemctl disable sssd-pac.socket`, der Responder läuft weiter |
 | `join.secret` fehlt auf dem Klon | Normal nach erfolgreichem Join | `post-clone.sh --force` fragt das Passwort ab |
 | Kein Auto-Join trotz Absicht | Beim Bau kein Passwort angegeben | `ENABLE_JOIN` in `firstboot.conf` prüfen, Secret nachtragen |
 | AD-User fehlt `sudo` | Gruppenname falsch geschrieben | `/etc/sudoers.d/ad-admins` prüfen, unquotiert schreiben |
 | `sudo` streikt nach Änderung an `sudoers.d` | Datei parst unter sudo-rs nicht | Aus Root-Shell entfernen, unquotiert neu schreiben, `visudo -c -f` |
 | SSH verweigert AD-Login | Gruppe fehlt in `AllowGroups` | `/etc/ssh/sshd_config.d/99-vita-brevis.conf` prüfen |
+| AD-Login scheitert, `su` und `kinit` gehen | Schreibweise der Gruppe weicht ab | `id <user>@<domain>` zeigt den echten Namen, `AllowGroups` darauf setzen |
+| Kerberos-Preauth-Fehler trotz korrektem Passwort | sshd lehnte per `AllowGroups` ab und setzte ein Dummy-Passwort ein | `journalctl -t sshd-session -b` nach `not allowed` durchsuchen, nicht Kerberos verdächtigen |
 | SNMP: `Unknown Object Identifier` | MIB-Dateien nicht installiert | Numerische OID verwenden |
 | Boot hängt bei networkd | `networkd-wait-online` nicht maskiert | Siehe Teil 2.3, Schritt 7 |
 | Boot hängt trotz Maskierung (26.04) | netplan 1.2 wartet auf routbare Adresse und DNS | `optional: true` im Netplan-Fallback ergänzen |
 | Log: „cloud-init nicht sauber abgeschlossen" | Exit-Code 2 bedeutet behebbarer Fehler, nicht Abbruch | `cloud-init status --long` ansehen, Firstboot läuft trotzdem weiter |
 | Erste SSH-Verbindung: `no host keys available` | Host Keys wurden nach dem Klonen nicht erzeugt | `systemctl status ssh-host-keys.service`, notfalls `ssh-keygen -A` |
-| `systemctl reload ssh` schlägt fehl | Bei Socket-Aktivierung ist `ssh.service` inaktiv | Nicht nötig, jede neue Verbindung liest die Konfiguration frisch |
+| `systemctl reload ssh` schlägt fehl | `ssh.service` läuft noch nicht, nur `ssh.socket` | Unkritisch, die erste Verbindung startet sshd mit der neuen Konfiguration |
+| Änderung an `sshd_config.d` wirkt nicht | Der laufende `sshd -D` liest sie nur beim Start | `sudo systemctl reload ssh`, Socket-Aktivierung ändert daran nichts |
 
 ---
 
@@ -683,8 +693,8 @@ oder `domain-join.sh` von Hand gejoint.
 
 ```bash
 # Template bauen
-git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git
-cd ubuntu-templating
+sudo git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git /opt/ubuntu-templating
+cd /opt/ubuntu-templating
 sudo ./prepare-template.sh
 sudo ./seal-template.sh
 sudo shutdown -h now
