@@ -639,6 +639,8 @@ sudo journalctl -u vb-firstboot -n 50
 | AD-User fehlt `sudo` | Gruppenname falsch geschrieben | `/etc/sudoers.d/ad-admins` prüfen, unquotiert schreiben |
 | `sudo` streikt nach Änderung an `sudoers.d` | Datei parst unter sudo-rs nicht | Aus Root-Shell entfernen, unquotiert neu schreiben, `visudo -c -f` |
 | SSH verweigert AD-Login | Gruppe fehlt in `AllowGroups` | `/etc/ssh/sshd_config.d/99-vita-brevis.conf` prüfen |
+| AD-Login scheitert, `su` und `kinit` gehen | Schreibweise der Gruppe weicht ab | `id <user>@<domain>` zeigt den echten Namen, `AllowGroups` darauf setzen |
+| Kerberos-Preauth-Fehler trotz korrektem Passwort | sshd lehnte per `AllowGroups` ab und setzte ein Dummy-Passwort ein | `journalctl -t sshd-session -b` nach `not allowed` durchsuchen, nicht Kerberos verdächtigen |
 | SNMP: `Unknown Object Identifier` | MIB-Dateien nicht installiert | Numerische OID verwenden |
 | Boot hängt bei networkd | `networkd-wait-online` nicht maskiert | Siehe Teil 2.3, Schritt 7 |
 | Boot hängt trotz Maskierung (26.04) | netplan 1.2 wartet auf routbare Adresse und DNS | `optional: true` im Netplan-Fallback ergänzen |

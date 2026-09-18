@@ -348,9 +348,27 @@ log "SSH Hardening konfigurieren"
 # Leerzeichen ("Domain Admins") zerfiele unquotiert still in zwei Muster
 # — 'sshd -t' meldet das NICHT, die Regel waere aber falsch. Deshalb das
 # ganze Muster quoten, sobald ein Leerzeichen vorkommt.
-AD_SSH_PATTERN="${AD_ADMIN_GROUP}@${AD_DOMAIN}"
-if [[ "${AD_SSH_PATTERN}" == *" "* ]]; then
-    AD_SSH_PATTERN="\"${AD_SSH_PATTERN}\""
+ssh_pattern() {
+    local p="$1"
+    if [[ "$p" == *" "* ]]; then printf '"%s"' "$p"; else printf '%s' "$p"; fi
+}
+
+# Zur Schreibweise: sshd vergleicht Gruppennamen ZEICHENGENAU, SSSD
+# nicht. Beim AD-Provider ist 'case_sensitive = True' laut sssd.conf(5)
+# sogar ungueltig, der Default ist False — Namen kommen aus NSS also
+# kleingeschrieben zurueck, egal wie sie im Verzeichnis stehen.
+# Wer hier 'G_server-admin' eintippt, bekommt von 'getent group' brav
+# einen Treffer, waehrend sshd denselben Benutzer abweist, weil in
+# dessen Gruppenliste 'g_server-admin@domain' steht.
+# Deshalb die Kleinschreibung als Standard, die eingegebene Variante
+# zusaetzlich fuer den Fall 'case_sensitive = Preserving'.
+# vb-firstboot.sh zieht die Zeile nach dem Join ohnehin auf den
+# tatsaechlich gelieferten Namen nach.
+AD_GROUP_TYPED="${AD_ADMIN_GROUP}@${AD_DOMAIN}"
+AD_GROUP_LOWER="${AD_GROUP_TYPED,,}"
+AD_SSH_PATTERN="$(ssh_pattern "${AD_GROUP_LOWER}")"
+if [[ "${AD_GROUP_TYPED}" != "${AD_GROUP_LOWER}" ]]; then
+    AD_SSH_PATTERN="${AD_SSH_PATTERN} $(ssh_pattern "${AD_GROUP_TYPED}")"
 fi
 
 cat > /etc/ssh/sshd_config.d/99-vita-brevis.conf <<EOF

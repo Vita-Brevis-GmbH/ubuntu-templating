@@ -248,6 +248,24 @@ sudo sshd -t && sudo systemctl try-reload-or-restart ssh
 > `prepare-template.sh` das Drop-in wieder, statt die laufende SSH-Sitzung zu
 > riskieren.
 
+> ⚠️ **Gross- und Kleinschreibung entscheidet hier.** sshd vergleicht
+> Gruppennamen zeichengenau. SSSD ist beim AD-Provider dagegen zwingend
+> case-insensitiv, `case_sensitive = True` ist laut `sssd.conf(5)` für AD
+> sogar ungültig. Namen kommen aus NSS deshalb **kleingeschrieben** zurück,
+> unabhängig davon, wie sie im Verzeichnis stehen.
+>
+> Das Fehlerbild ist tückisch: `getent group G_server-admin@domain` liefert
+> einen Treffer, weil die Suche case-insensitiv ist. `id` zeigt aber
+> `g_server-admin@domain`, und sshd findet keine Übereinstimmung. Es weist
+> ab und ersetzt dabei das eingegebene Passwort durch eine Dummy-Zeichenkette
+> (Schutz vor Timing-Angriffen). Im Log landet dann ein
+> Kerberos-Preauth-Fehler statt einer Zugriffsverweigerung, während `su` und
+> `kinit` mit demselben Passwort einwandfrei funktionieren.
+>
+> `prepare-template.sh` schreibt deshalb die Kleinschreibung, und
+> `vb-firstboot.sh` zieht die Zeile nach dem Join auf den tatsächlich
+> gelieferten Namen nach.
+
 ### Schritt 4b — SSH Host Keys vor sshd regenerieren
 
 Nach dem Versiegeln (Part 7) werden die Host Keys gelöscht. cloud-init generiert sie zwar neu, aber `sshd` startet oft schneller als cloud-init die Config-Phase erreicht — Ergebnis: `no host keys available`.
@@ -1045,6 +1063,8 @@ sudo ./post-clone.sh --password
 | SNMP: `Unknown Object Identifier` | MIB-Dateien fehlen (`snmp-mibs-downloader`) | Numerische OID verwenden, z.B. `.1.3.6.1.2.1.1.1.0` |
 | Sudoers-Änderung greift nicht    | SSSD cached Gruppenmitgliedschaft  | `rm -rf /var/lib/sss/db/*`, SSSD restart, neu einloggen |
 | Login verweigert                 | User nicht in erlaubter Gruppe      | `ad_access_filter` oder `AllowGroups` prüfen    |
+| AD-Login scheitert, `su` und `kinit` gehen | Schreibweise der Gruppe in `AllowGroups` weicht ab | `id <user>@<domain>` zeigt den echten Namen, `AllowGroups` darauf setzen |
+| Log zeigt Kerberos-Preauth-Fehler trotz korrektem Passwort | sshd hat per `AllowGroups` abgelehnt und ein Dummy-Passwort eingesetzt | Nicht Kerberos prüfen, sondern `journalctl -t sshd-session -b` nach `not allowed` durchsuchen |
 | Home-Verzeichnis fehlt           | pam_mkhomedir nicht aktiv           | `pam-auth-update --enable mkhomedir`            |
 | Offline-Login schlägt fehl       | `cache_credentials = False`         | `cache_credentials = True` in sssd.conf setzen  |
 
