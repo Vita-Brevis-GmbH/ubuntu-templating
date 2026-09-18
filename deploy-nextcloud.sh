@@ -3,11 +3,25 @@
 #  deploy-nextcloud.sh
 #  Bereitet eine geklonte VM fuer die Rolle "Nextcloud Server" vor.
 #  - LVM Disk Setup nach /data (wird uebersprungen wenn /data bereits gemountet)
-#  - Nextcloud Installation (Apache, MariaDB, PHP 8.3)
+#  - Nextcloud Installation (Apache + PHP-FPM, MariaDB, Redis, PHP 8.5)
+#
+#  Tuning-Werte gemaess Aenderungsdokumentation M. Hadorn (01.09.2026),
+#  Referenzinstallation fil01-nsh-sef (8 GB RAM). Bei abweichender
+#  RAM-Ausstattung die Werte im Konfigurationsblock unten anpassen.
 #
 #  Verwendung: sudo ./deploy-nextcloud.sh
 # ─────────────────────────────────────────────────────────────────
 set -euo pipefail
+
+# ── Konfiguration ──────────────────────────────────────────────
+# PHP 8.5 ist in Ubuntu 24.04 nicht enthalten und kommt aus ppa:ondrej/php
+PHP_VER="8.5"
+
+# Tuning-Werte der Referenzinstallation (8 GB RAM)
+INNODB_BUFFER_POOL="2G"          # ~25% RAM
+REDIS_MAXMEMORY="512mb"
+FPM_MAX_CHILDREN="14"            # bei RAM-Reserve auf 20 erhoehen
+NC_TMPDIR="/var/nc-tmp"
 
 # ── Hilfsfunktionen ────────────────────────────────────────────
 STEP=0
@@ -56,7 +70,7 @@ fi
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║  Deploy: Nextcloud Server                                ║"
-echo "║  LVM + Apache + MariaDB + PHP 8.3 + Nextcloud           ║"
+printf "║  LVM + Apache/FPM + MariaDB + Redis + PHP %-4s           ║\n" "${PHP_VER}"
 echo "╚══════════════════════════════════════════════════════════╝"
 
 # ── Pruefen ob /data bereits gemountet ist ─────────────────────
@@ -68,9 +82,9 @@ if mountpoint -q "${MOUNT_POINT}" 2>/dev/null; then
     echo "  ${MOUNT_POINT} ist bereits gemountet — LVM-Setup wird uebersprungen."
     df -h "${MOUNT_POINT}"
     SKIP_LVM=true
-    TOTAL=6
+    TOTAL=7
 else
-    TOTAL=10
+    TOTAL=11
 fi
 
 # ================================================================
@@ -255,36 +269,78 @@ fi
 # ================================================================
 # Schritt 5 — Pakete installieren
 # ================================================================
-log "Pakete installieren (Apache, MariaDB, PHP 8.3)"
+log "Pakete installieren (Apache, MariaDB, Redis, PHP ${PHP_VER})"
 
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
+
+# PHP 8.5 ist nicht in Ubuntu 24.04 enthalten — ondrej/php PPA einbinden
+if ! apt-cache show "php${PHP_VER}-fpm" &>/dev/null; then
+    echo "    PHP ${PHP_VER} nicht in den Ubuntu-Quellen — ppa:ondrej/php einbinden..."
+    apt-get install -y software-properties-common
+    add-apt-repository -y ppa:ondrej/php
+    apt-get update
+    echo "    PPA eingebunden."
+fi
 apt-get install -y \
     apache2 \
     mariadb-server \
-    libapache2-mod-php \
-    php8.3 \
-    php8.3-gd \
-    php8.3-mysql \
-    php8.3-curl \
-    php8.3-mbstring \
-    php8.3-intl \
-    php8.3-gmp \
-    php8.3-bcmath \
-    php8.3-xml \
-    php8.3-zip \
-    php8.3-bz2 \
-    php8.3-imagick \
-    php8.3-opcache \
-    php8.3-apcu \
-    php8.3-redis \
-    php8.3-ldap \
+    redis-server \
+    "php${PHP_VER}-fpm" \
+    "php${PHP_VER}-cli" \
+    "php${PHP_VER}-gd" \
+    "php${PHP_VER}-mysql" \
+    "php${PHP_VER}-curl" \
+    "php${PHP_VER}-mbstring" \
+    "php${PHP_VER}-intl" \
+    "php${PHP_VER}-gmp" \
+    "php${PHP_VER}-bcmath" \
+    "php${PHP_VER}-xml" \
+    "php${PHP_VER}-zip" \
+    "php${PHP_VER}-bz2" \
+    "php${PHP_VER}-imagick" \
+    "php${PHP_VER}-opcache" \
+    "php${PHP_VER}-apcu" \
+    "php${PHP_VER}-redis" \
+    "php${PHP_VER}-ldap" \
+    ffmpeg \
+    librsvg2-common \
     bzip2 \
     unzip \
-    wget
+    wget \
+    curl \
+    cron
+
+# Imagick-Delegates fuer SVG/HEIC — Paketname variiert je nach ImageMagick-Version
+IMAGICK_EXTRA_OK=false
+for pkg in libmagickcore-7.q16-10-extra libmagickcore-6.q16-6-extra; do
+    if apt-cache show "$pkg" &>/dev/null && apt-get install -y "$pkg"; then
+        IMAGICK_EXTRA_OK=true
+        break
+    fi
+done
+if [[ "${IMAGICK_EXTRA_OK}" != true ]]; then
+    echo "    HINWEIS: Kein passendes libmagickcore-*-extra Paket gefunden."
+    echo "    SVG-Vorschauen bleiben deaktiviert. Passendes Delegate-Paket"
+    echo "    ermitteln mit: ldd /usr/lib/php/*/imagick.so | grep -i magick"
+fi
 
 echo "    Alle Pakete installiert."
+
+# Mit dem PPA koennen mehrere PHP-Versionen parallel liegen — sicherstellen,
+# dass 'php' (und damit jeder occ-Aufruf) auf die gewuenschte Version zeigt.
+if [[ -x "/usr/bin/php${PHP_VER}" ]]; then
+    update-alternatives --set php "/usr/bin/php${PHP_VER}" &>/dev/null || true
+fi
+
+ACTIVE_PHP=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo "?")
+if [[ "${ACTIVE_PHP}" != "${PHP_VER}" ]]; then
+    echo "  Fehler: 'php' zeigt auf Version ${ACTIVE_PHP}, erwartet ${PHP_VER}."
+    echo "  Korrigieren mit: update-alternatives --config php"
+    exit 1
+fi
+echo "    Aktive PHP-CLI-Version: ${ACTIVE_PHP}"
 
 # ================================================================
 # Schritt 6 — MariaDB konfigurieren
@@ -295,25 +351,23 @@ log "MariaDB konfigurieren"
 systemctl is-active --quiet mariadb || systemctl start mariadb
 
 # MariaDB-Tuning fuer Nextcloud (READ-COMMITTED, binlog ROW, InnoDB)
-MARIADB_TUNING="/etc/mysql/mariadb.conf.d/90-nextcloud.cnf"
+MARIADB_TUNING="/etc/mysql/mariadb.conf.d/60-nextcloud.cnf"
 if [[ -f "${MARIADB_TUNING}" ]]; then
     echo "    MariaDB-Tuning ${MARIADB_TUNING} existiert bereits — uebersprungen."
 else
     echo "    Schreibe MariaDB-Tuning nach ${MARIADB_TUNING}..."
-    cat > "${MARIADB_TUNING}" <<'EOF'
+    cat > "${MARIADB_TUNING}" <<EOF
 # Nextcloud MariaDB Tuning
 # Siehe: https://docs.nextcloud.com/server/latest/admin_manual/configuration_database/linux_database_configuration.html
 [mysqld]
+innodb_buffer_pool_size   = ${INNODB_BUFFER_POOL}
+innodb_flush_log_at_trx_commit = 2
+innodb_file_per_table     = 1
 transaction_isolation     = READ-COMMITTED
 binlog_format             = ROW
-innodb_file_per_table     = 1
-innodb_buffer_pool_size   = 512M
-innodb_log_file_size      = 64M
-innodb_flush_log_at_trx_commit = 2
-innodb_flush_method       = O_DIRECT
-character-set-server      = utf8mb4
-collation-server          = utf8mb4_general_ci
-skip-character-set-client-handshake
+tmp_table_size            = 64M
+max_heap_table_size       = 64M
+read_rnd_buffer_size      = 4M
 EOF
     systemctl restart mariadb
     echo "    MariaDB mit neuer Konfiguration neu gestartet."
@@ -363,7 +417,61 @@ else
 fi
 
 # ================================================================
-# Schritt 7 — Nextcloud herunterladen & entpacken
+# Schritt 7 — Redis konfigurieren (Locking + verteilter Cache)
+# ================================================================
+log "Redis konfigurieren (Unix-Socket, Locking-Cache)"
+
+# Redis auf Unix-Socket umstellen — kein TCP-Overhead
+REDIS_SOCKET="/run/redis/redis-server.sock"
+
+if grep -q "^unixsocket ${REDIS_SOCKET}" /etc/redis/redis.conf 2>/dev/null; then
+    echo "    Redis ist bereits auf Unix-Socket konfiguriert — uebersprungen."
+else
+    echo "    Redis-Konfiguration anpassen..."
+    cp -n /etc/redis/redis.conf /etc/redis/redis.conf.orig 2>/dev/null || true
+
+    # Vorhandene Direktiven entfernen, dann sauber neu setzen
+    sed -i -E '/^[[:space:]]*#?[[:space:]]*(unixsocket|unixsocketperm|maxmemory|maxmemory-policy)[[:space:]]/d' \
+        /etc/redis/redis.conf
+
+    cat >> /etc/redis/redis.conf <<EOF
+
+# ── Nextcloud Tuning ────────────────────────────────────────────
+unixsocket ${REDIS_SOCKET}
+unixsocketperm 770
+maxmemory ${REDIS_MAXMEMORY}
+maxmemory-policy volatile-lru
+EOF
+    echo "    Redis-Konfiguration geschrieben (Socket, ${REDIS_MAXMEMORY}, volatile-lru)."
+fi
+
+# www-data braucht Gruppenmitgliedschaft fuer den Socket (unixsocketperm 770)
+if id -nG www-data | tr ' ' '\n' | grep -qx redis; then
+    echo "    www-data ist bereits in der Gruppe 'redis'."
+else
+    usermod -aG redis www-data
+    echo "    www-data zur Gruppe 'redis' hinzugefuegt."
+fi
+
+systemctl enable --now redis-server
+systemctl restart redis-server
+
+# Socket-Verfuegbarkeit pruefen (systemd braucht einen Moment)
+for _ in {1..10}; do
+    [[ -S "${REDIS_SOCKET}" ]] && break
+    sleep 1
+done
+
+if [[ -S "${REDIS_SOCKET}" ]]; then
+    echo "    Redis laeuft, Socket ${REDIS_SOCKET} verfuegbar."
+else
+    echo "    WARNUNG: Redis-Socket ${REDIS_SOCKET} nicht gefunden!"
+    echo "    Pruefen mit: systemctl status redis-server"
+    exit 1
+fi
+
+# ================================================================
+# Schritt 8 — Nextcloud herunterladen & entpacken
 # ================================================================
 log "Nextcloud herunterladen & entpacken"
 
@@ -391,14 +499,28 @@ echo "    Datenverzeichnis ${NC_DATA} erstellen..."
 mkdir -p "${NC_DATA}"
 chown www-data:www-data "${NC_DATA}"
 
-echo "    Schritt 7 abgeschlossen."
+# Eigenes Temp-Verzeichnis: /tmp ist auf der Root-Disk zu klein fuer grosse
+# Uploads — abgebrochene Uploads waren Mitursache haengender Sperren.
+echo "    Temp-Verzeichnis ${NC_TMPDIR} erstellen..."
+mkdir -p "${NC_TMPDIR}"
+chown www-data:www-data "${NC_TMPDIR}"
+chmod 750 "${NC_TMPDIR}"
+
+echo "    Schritt abgeschlossen."
 
 # ================================================================
-# Schritt 8 — Apache konfigurieren
+# Schritt 9 — Apache + PHP-FPM konfigurieren
 # ================================================================
-log "Apache konfigurieren"
+log "Apache + PHP-FPM konfigurieren (mpm_event statt mod_php)"
+
+# mod_php/prefork abloesen — FPM mit mpm_event ist der groesste Einzelgewinn
+echo "    mod_php und mpm_prefork deaktivieren..."
+a2dismod "php${PHP_VER}" 2>/dev/null || true
+a2dismod mpm_prefork 2>/dev/null || true
 
 echo "    Apache-Module aktivieren..."
+a2enmod mpm_event proxy_fcgi setenvif http2
+a2enconf "php${PHP_VER}-fpm"
 a2enmod rewrite headers env dir mime ssl socache_shmcb
 
 # Selbstsigniertes Zertifikat erzeugen falls noch keines vorhanden
@@ -456,44 +578,106 @@ EOF
 
 echo "    Vhost /etc/apache2/sites-available/nextcloud.conf erstellt (HTTP+HTTPS)."
 
+# Globalen ServerName setzen — beseitigt die AH00558-Warnung beim Start
+if [[ ! -f /etc/apache2/conf-available/servername.conf ]]; then
+    echo "ServerName $(hostname -f 2>/dev/null || hostname)" \
+        > /etc/apache2/conf-available/servername.conf
+    a2enconf servername
+    echo "    Globaler ServerName gesetzt."
+fi
+
 a2dissite 000-default.conf 2>/dev/null || true
 a2dissite default-ssl.conf 2>/dev/null || true
 a2ensite nextcloud.conf
 
-systemctl restart apache2
-echo "    Apache konfiguriert und neu gestartet."
+# ── PHP-FPM Pool ───────────────────────────────────────────────
+FPM_POOL="/etc/php/${PHP_VER}/fpm/pool.d/www.conf"
+
+echo "    PHP-FPM Pool konfigurieren (max_children=${FPM_MAX_CHILDREN})..."
+for setting in \
+    "pm = dynamic" \
+    "pm.max_children = ${FPM_MAX_CHILDREN}" \
+    "pm.start_servers = 6" \
+    "pm.min_spare_servers = 4" \
+    "pm.max_spare_servers = 12" \
+    "pm.max_requests = 500"
+do
+    key="${setting%% =*}"
+    # Vorhandene (auch auskommentierte) Direktive ersetzen, sonst anhaengen
+    if grep -qE "^[;[:space:]]*${key//./\\.}[[:space:]]*=" "${FPM_POOL}"; then
+        sed -i -E "s|^[;[:space:]]*${key//./\\.}[[:space:]]*=.*|${setting}|" "${FPM_POOL}"
+    else
+        echo "${setting}" >> "${FPM_POOL}"
+    fi
+done
+
+echo "    FPM-Pool ${FPM_POOL} angepasst."
 
 # ================================================================
-# Schritt 9 — PHP Tuning
+# Schritt 10 — PHP Tuning
 # ================================================================
-log "PHP Tuning"
+log "PHP Tuning (zentral via mods-available)"
 
-PHP_INI_DIR="/etc/php/8.3/apache2/conf.d"
+# Zentrale Konfiguration fuer alle SAPIs (fpm, cli, apache2) statt getrennter
+# Pflege pro SAPI. phpenmod verlinkt sie als 20-nextcloud.ini.
+PHP_MODS_DIR="/etc/php/${PHP_VER}/mods-available"
 
-cat > "${PHP_INI_DIR}/99-nextcloud.ini" <<'EOF'
+cat > "${PHP_MODS_DIR}/nextcloud.ini" <<EOF
 ; Nextcloud PHP Tuning
+; Gemaess Aenderungsdokumentation M. Hadorn (01.09.2026)
+
 memory_limit = 512M
 upload_max_filesize = 16G
 post_max_size = 16G
 max_execution_time = 3600
 max_input_time = 3600
+output_buffering = 0
+
+; Sessions: NC nimmt intern 24 h an — der Default von 1440 s liess den
+; systemd-Timer phpsessionclean Sessions loeschen (Ursache Neuanmeldungen).
+session.gc_maxlifetime = 86400
+
+; Eigenes Temp-Verzeichnis, /tmp ist zu klein fuer grosse Uploads
+upload_tmp_dir = ${NC_TMPDIR}
+sys_temp_dir = ${NC_TMPDIR}
+
+; APCu — 32M fuehrte zur Eviction des Token-Caches
+apc.enable_cli = 1
+apc.shm_size = 256M
 
 ; OPcache
 opcache.enable = 1
-opcache.interned_strings_buffer = 16
-opcache.max_accelerated_files = 10000
-opcache.memory_consumption = 128
+opcache.enable_cli = 1
+opcache.memory_consumption = 256
+opcache.interned_strings_buffer = 32
+opcache.max_accelerated_files = 20000
+opcache.revalidate_freq = 60
 opcache.save_comments = 1
-opcache.revalidate_freq = 1
+
+; JIT bringt bei Nextcloud keinen Nutzen
+opcache.jit = disable
+opcache.jit_buffer_size = 0
+
+; Beseitigt "Allocation of JIT memory failed" bei jedem preg_match
+pcre.jit = 0
 EOF
 
-echo "    ${PHP_INI_DIR}/99-nextcloud.ini geschrieben."
+echo "    ${PHP_MODS_DIR}/nextcloud.ini geschrieben."
 
+phpenmod -v "${PHP_VER}" nextcloud
+echo "    Konfiguration fuer alle SAPIs aktiviert (20-nextcloud.ini)."
+
+# Altlasten aus frueheren Laeufen entfernen — die 20er-Verlinkung ist massgebend
+for old in "/etc/php/${PHP_VER}"/*/conf.d/99-nextcloud.ini; do
+    [[ -e "$old" ]] && rm -f "$old" && echo "    Alte $old entfernt."
+done
+
+systemctl restart "php${PHP_VER}-fpm"
 systemctl restart apache2
-echo "    Apache mit neuer PHP-Konfiguration neu gestartet."
+echo "    PHP-FPM und Apache neu gestartet."
 
 # ================================================================
-# Schritt 10 — Nextcloud Einrichtung (occ)
+# Schritt 11 — Nextcloud Einrichtung (occ)
 # ================================================================
 log "Nextcloud Einrichtung via occ"
 
@@ -555,13 +739,61 @@ echo "    Trusted Domains konfigurieren..."
 sudo -u www-data php occ config:system:set trusted_domains 0 --value="localhost"
 sudo -u www-data php occ config:system:set trusted_domains 1 --value="${SERVER_IP}"
 
-# APCu Memory Cache
-sudo -u www-data php occ config:system:set memcache.local --value="\\OC\\Memcache\\APCu"
+# ── Caching und Locking ────────────────────────────────────────
+# Ohne Redis faellt NC auf DB-Locking zurueck. DB-Locks haben keine TTL:
+# jeder abgebrochene PHP-Prozess hinterlaesst eine dauerhafte Sperre.
+echo "    Redis-Anbindung konfigurieren..."
+sudo -u www-data php occ config:system:set redis host --value="${REDIS_SOCKET}"
+sudo -u www-data php occ config:system:set redis port --value=0 --type=integer
+sudo -u www-data php occ config:system:set redis timeout --value=1.5 --type=double
 
-# Default-Telefon-Region
+sudo -u www-data php occ config:system:set memcache.local --value="\\OC\\Memcache\\APCu"
+sudo -u www-data php occ config:system:set memcache.locking --value="\\OC\\Memcache\\Redis"
+sudo -u www-data php occ config:system:set memcache.distributed --value="\\OC\\Memcache\\Redis"
+sudo -u www-data php occ config:system:set filelocking.enabled --value=true --type=boolean
+
+# ── Weitere Systemeinstellungen ────────────────────────────────
+echo "    Systemeinstellungen setzen..."
 sudo -u www-data php occ config:system:set default_phone_region --value="CH"
+sudo -u www-data php occ config:system:set tempdirectory --value="${NC_TMPDIR}"
+sudo -u www-data php occ config:system:set log_rotate_size --value=104857600 --type=integer
+# Schwere Hintergrundjobs 01:00–05:00 UTC (03:00–07:00 lokal)
+sudo -u www-data php occ config:system:set maintenance_window_start --value=1 --type=integer
+sudo -u www-data php occ config:system:set overwrite.cli.url --value="https://${SERVER_IP}"
+
+# ── Hintergrundjobs via System-Cron ────────────────────────────
+# AJAX-Jobs sind nicht empfohlen; Cron laeuft alle 5 Minuten.
+echo "    Cron fuer Hintergrundjobs einrichten..."
+CRON_LINE="*/5 * * * * /usr/bin/php${PHP_VER} -f ${NC_DEST}/cron.php"
+if crontab -u www-data -l 2>/dev/null | grep -qF "${NC_DEST}/cron.php"; then
+    echo "    Cron-Eintrag existiert bereits — uebersprungen."
+else
+    { crontab -u www-data -l 2>/dev/null || true; echo "${CRON_LINE}"; } \
+        | crontab -u www-data -
+    echo "    Cron-Eintrag fuer www-data angelegt (alle 5 Minuten)."
+fi
+sudo -u www-data php occ background:cron
+
+# ── Datenbankschema vervollstaendigen ──────────────────────────
+echo "    Datenbankschema pruefen und vervollstaendigen..."
+sudo -u www-data php occ db:add-missing-indices
+sudo -u www-data php occ db:add-missing-columns
+sudo -u www-data php occ db:add-missing-primary-keys
 
 echo "    Nextcloud konfiguriert."
+
+# ── Smoke-Test ─────────────────────────────────────────────────
+echo "    Erreichbarkeit pruefen..."
+if curl -fsSk -o /dev/null "https://localhost/status.php"; then
+    echo "    status.php antwortet."
+else
+    echo "    WARNUNG: https://localhost/status.php nicht erreichbar."
+    echo "    Pruefen mit: systemctl status apache2 php${PHP_VER}-fpm"
+fi
+
+echo ""
+echo "  Setup-Checks (nur Abweichungen):"
+sudo -u www-data php occ setupchecks 2>/dev/null | grep -v '✓' || true
 
 # ================================================================
 # Abschluss
@@ -574,10 +806,17 @@ printf "║  %-18s %-39s║\n" "URL:" "https://${SERVER_IP}"
 printf "║  %-18s %-39s║\n" "Admin-User:" "${NC_ADMIN_USER}"
 printf "║  %-18s %-39s║\n" "Datenverzeichnis:" "${NC_DATA}"
 printf "║  %-18s %-39s║\n" "Datenbank:" "nextcloud@localhost (MariaDB)"
+printf "║  %-18s %-39s║\n" "Cache/Locking:" "Redis (Unix-Socket)"
+printf "║  %-18s %-39s║\n" "PHP:" "${PHP_VER} via FPM (mpm_event)"
+printf "║  %-18s %-39s║\n" "Temp-Verzeichnis:" "${NC_TMPDIR}"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Naechste Schritte:                                      ║"
 echo "║  - Snake-Oil-Zertifikat durch Let's Encrypt ersetzen    ║"
 echo "║    (certbot --apache) oder eigene CA einbinden          ║"
 echo "║  - Trusted Domains anpassen falls noetig                ║"
 echo "║  - Backup-Strategie einrichten                          ║"
+echo "║  - Bei LDAP-Anbindung: ldapCacheTTL auf 1800 setzen,    ║"
+echo "║    ldapConnectionTimeout auf 8                          ║"
+echo "║  - Unter Last pruefen: meldet FPM 'max_children',       ║"
+printf "║    %-18s %-35s║\n" "pm.max_children" "von ${FPM_MAX_CHILDREN} auf 20 erhoehen"
 echo "╚══════════════════════════════════════════════════════════╝"
