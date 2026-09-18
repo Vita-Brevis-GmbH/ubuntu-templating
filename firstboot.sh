@@ -332,7 +332,13 @@ cat > /etc/sssd/sssd.conf <<EOF
 [sssd]
 domains = ${AD_DOMAIN}
 config_file_version = 2
-services = nss, pam, sudo
+# Bewusst KEINE 'services'-Zeile. Auf systemd-Systemen ist sie laut
+# sssd.conf(5) optional, weil die Responder per Socket aktiviert werden.
+# Steht ein Responder hier drin, startet der SSSD-Monitor ihn selbst und
+# belegt dessen Socket. Die gleichnamige systemd-Unit scheitert dann in
+# ihrem ExecStartPre (sssd_check_socket_activated_responders) und meldet
+# beim Booten 'Failed to listen on sssd-<name>.socket'. Funktional
+# harmlos, aber es sieht nach einem kaputten Join aus.
 # Hinweis: KEIN 'default_domain_suffix' setzen — laut SSSD-Doku
 # inkompatibel mit sudo.
 
@@ -354,10 +360,35 @@ EOF
 chmod 600 /etc/sssd/sssd.conf
 
 systemctl enable sssd >/dev/null 2>&1 || warn "'systemctl enable sssd' fehlgeschlagen."
+
+# Ohne 'services'-Zeile in der sssd.conf kommen die Responder
+# ausschliesslich ueber Socket-Aktivierung hoch. Sicherstellen, dass die
+# Units da sind — im Template sind sie aktiviert, aber ein Klon soll
+# sich nicht darauf verlassen muessen.
+for _sock in sssd-nss sssd-pam sssd-sudo; do
+    systemctl enable "${_sock}.socket" >/dev/null 2>&1 || true
+done
+# Siehe prepare-template.sh: dieser eine Socket kollidiert bei
+# 'id_provider = ad' immer mit dem implizit gestarteten PAC-Responder.
+systemctl disable sssd-pac.socket >/dev/null 2>&1 || true
+
 if ! systemctl restart sssd; then
     die "SSSD startet nicht. Pruefen: journalctl -u sssd -n 50"
 fi
 log "        SSSD laeuft und ist aktiviert."
+
+# Fehlgeschlagene sssd-Units melden. Seit die Responder ueber Sockets
+# kommen, ist das kein kosmetisches Detail mehr — scheitert hier eine
+# Unit, funktioniert der zugehoerige Dienst nicht.
+_failed_units="$(systemctl list-units --failed --plain --no-legend --no-pager 2>/dev/null \
+    | awk '$1 ~ /^sssd/ {printf " %s", $1}')"
+if [[ -n "$_failed_units" ]]; then
+    warn "Fehlgeschlagene SSSD-Units:${_failed_units}
+        Pruefen mit: systemctl status <unit>"
+else
+    log "        Keine fehlgeschlagenen SSSD-Units."
+fi
+unset _failed_units
 
 # ── Verifikation (nicht-interaktiv) ─────────────────────────────
 VERIFY_OK="no"

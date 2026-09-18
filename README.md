@@ -435,7 +435,7 @@ sudo vim /etc/sssd/sssd.conf
 [sssd]
 domains = int.vitabrevis.ch
 config_file_version = 2
-services = nss, pam, sudo
+# Bewusst KEINE 'services'-Zeile — siehe Hinweis unten.
 # Hinweis: KEIN 'default_domain_suffix' setzen — es ist laut SSSD-Doku
 # inkompatibel mit sudo und bricht das Matching gruppenbasierter
 # sudoers-Regeln (%G_server-admin@domain) sowie die Namensauflösung der
@@ -465,6 +465,40 @@ dyndns_update = True
 # sssd.conf muss nur für root lesbar sein
 sudo chmod 600 /etc/sssd/sssd.conf
 ```
+
+> **Warum keine `services`-Zeile mehr.** Laut `sssd.conf(5)` ist sie auf
+> systemd-Systemen optional, weil die Responder per Socket aktiviert werden.
+> Steht ein Responder trotzdem darin, startet der SSSD-Monitor ihn selbst und
+> belegt dessen Socket. Die gleichnamige systemd-Unit scheitert dann in ihrem
+> `ExecStartPre` und meldet beim Booten `Failed to listen on
+> sssd-<name>.socket`. Funktional ist das harmlos, die Responder laufen ja.
+> Es sieht beim ersten Boot eines Klons aber aus wie ein kaputter Join, und
+> genau das soll die Konsole nicht zeigen.
+
+### Schritt 8b — Responder-Sockets
+
+Ohne `services`-Zeile kommen die Responder ausschliesslich über
+Socket-Aktivierung hoch. Die Units müssen also aktiviert sein. Die Paketierung
+erledigt das im `postinst`, `prepare-template.sh` setzt es zusätzlich explizit:
+
+```bash
+for s in sssd-nss sssd-pam sssd-sudo sssd-ssh sssd-autofs; do
+    sudo systemctl enable "$s.socket"
+done
+```
+
+Eine Ausnahme gibt es:
+
+```bash
+sudo systemctl disable sssd-pac.socket
+```
+
+> **Warum ausgerechnet dieser Socket.** Sobald eine Domain `id_provider = ad`
+> hat, hängt SSSD den PAC-Responder **implizit** an die Service-Liste an, ganz
+> unabhängig davon, was in der `sssd.conf` steht. Der Monitor startet ihn dann
+> selbst und belegt den Socket, und `sssd-pac.socket` scheitert bei jedem Boot.
+> Abschalten betrifft nur den redundanten Aktivierungsweg. Der PAC-Responder
+> selbst läuft weiter, und er wird auf AD auch gebraucht.
 
 ### Schritt 9 — Automatische Home-Verzeichnisse aktivieren
 ```bash
@@ -1039,6 +1073,8 @@ sudo ./post-clone.sh --password
 | Log: „Domain nicht erreichbar"             | DNS zeigt nicht auf die DCs                  | `nslookup _ldap._tcp.int.vitabrevis.ch`, DNS in der Spec korrigieren |
 | Join-Fehler „Insufficient permissions"     | Join-Account hat zu wenig Delegation         | Rechte auf der Computer-OU prüfen (Part 6c, Schritt 12d)       |
 | Firstboot lief gar nicht                   | Marker war beim Versiegeln noch da           | Im Template `rm /var/lib/vb-template/firstboot.done`, neu versiegeln |
+| Boot zeigt `Failed to listen on sssd-*.socket` | Responder steht in der `services`-Zeile der `sssd.conf` | Zeile entfernen, die Responder kommen per Socket-Aktivierung |
+| Nur `sssd-pac.socket` scheitert | Bei `id_provider = ad` startet der Monitor den PAC-Responder implizit | `systemctl disable sssd-pac.socket`, der Responder läuft weiter |
 | `join.secret` fehlt auf dem Klon           | Normal nach erfolgreichem Join               | Für einen erneuten Join fragt `post-clone.sh --force` das Passwort ab |
 | Kein Auto-Join, obwohl gewünscht           | Beim Bau kein Join-Passwort angegeben        | `ENABLE_JOIN` in `/etc/vb-template/firstboot.conf` prüfen, Secret nachtragen |
 

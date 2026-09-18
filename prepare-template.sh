@@ -518,7 +518,13 @@ cat > /etc/sssd/sssd.conf <<EOF
 [sssd]
 domains = ${AD_DOMAIN}
 config_file_version = 2
-services = nss, pam, sudo
+# Bewusst KEINE 'services'-Zeile. Auf systemd-Systemen ist sie laut
+# sssd.conf(5) optional, weil die Responder per Socket aktiviert werden.
+# Steht ein Responder hier drin, startet der SSSD-Monitor ihn selbst und
+# belegt dessen Socket. Die gleichnamige systemd-Unit scheitert dann in
+# ihrem ExecStartPre (sssd_check_socket_activated_responders) und meldet
+# beim Booten 'Failed to listen on sssd-<name>.socket'. Funktional
+# harmlos, aber es sieht nach einem kaputten Join aus.
 
 [domain/${AD_DOMAIN}]
 default_shell = /bin/bash
@@ -578,6 +584,25 @@ rm -f /etc/krb5.keytab
 
 systemctl disable sssd 2>/dev/null || true
 systemctl stop sssd 2>/dev/null || true
+
+# Responder-Sockets. Ohne 'services'-Zeile in der sssd.conf laufen die
+# Responder ausschliesslich ueber Socket-Aktivierung, also muessen die
+# Units aktiviert sein. Die Paketierung tut das zwar schon im postinst,
+# hier aber explizit — verlassen wollen wir uns darauf nicht.
+for _sock in sssd-nss sssd-pam sssd-sudo sssd-ssh sssd-autofs; do
+    systemctl enable "${_sock}.socket" 2>/dev/null || true
+done
+echo "    SSSD Responder-Sockets aktiviert."
+
+# sssd-pac.socket ist der Sonderfall. Sobald eine Domain
+# 'id_provider = ad' hat, haengt SSSD den PAC-Responder implizit an die
+# Service-Liste (confdb.c, add_implicit_services) — unabhaengig davon,
+# was in der sssd.conf steht. Der Monitor startet ihn dann selbst und
+# belegt den Socket, und die Unit scheitert bei jedem Boot.
+# Der Responder selbst bleibt aktiv, nur der redundante
+# Aktivierungsweg wird abgeschaltet.
+systemctl disable sssd-pac.socket 2>/dev/null || true
+echo "    sssd-pac.socket deaktiviert (PAC-Responder startet ueber den Monitor)."
 
 echo "    SSSD deaktiviert, Domain-Mitgliedschaft entfernt."
 echo "    Part 5 abgeschlossen."

@@ -634,6 +634,8 @@ sudo journalctl -u vb-firstboot -n 50
 | Join: „Already joined" und Keytab fehlt | Alte Mitgliedschaft aus dem Template | `realm leave`, `rm /etc/krb5.keytab`, dann `post-clone.sh --force` |
 | Kerberos schlägt fehl | Zeitabweichung über fünf Minuten | `timedatectl`, NTP prüfen |
 | Firstboot lief gar nicht | Marker war beim Versiegeln noch da | Im Template löschen, neu versiegeln |
+| Boot zeigt `Failed to listen on sssd-*.socket` | Responder steht in der `services`-Zeile der `sssd.conf` | Zeile entfernen, Responder kommen per Socket-Aktivierung |
+| Nur `sssd-pac.socket` scheitert | Bei `id_provider = ad` startet der Monitor den PAC-Responder implizit | `systemctl disable sssd-pac.socket`, der Responder läuft weiter |
 | `join.secret` fehlt auf dem Klon | Normal nach erfolgreichem Join | `post-clone.sh --force` fragt das Passwort ab |
 | Kein Auto-Join trotz Absicht | Beim Bau kein Passwort angegeben | `ENABLE_JOIN` in `firstboot.conf` prüfen, Secret nachtragen |
 | AD-User fehlt `sudo` | Gruppenname falsch geschrieben | `/etc/sudoers.d/ad-admins` prüfen, unquotiert schreiben |
