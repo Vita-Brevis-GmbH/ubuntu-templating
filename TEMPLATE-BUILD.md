@@ -183,9 +183,14 @@ sudo hostnamectl set-hostname ubuntu-2604-tpl
 
 ```bash
 sudo apt update && sudo apt install -y git
-git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git
-cd ubuntu-templating
+sudo git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git /opt/ubuntu-templating
+cd /opt/ubuntu-templating
 ```
+
+> **Nach `/opt`, nicht ins Home des Build-Users.** `seal-template.sh` löscht
+> diesen Benutzer samt Home-Verzeichnis. Läge das Repository dort, wäre es
+> nach dem Versiegeln weg, und beim nächsten Template-Update müsste man es
+> neu klonen. Unter `/opt` überlebt es.
 
 > Das komplette Repository wird gebraucht, nicht nur ein einzelnes Script.
 > `prepare-template.sh` installiert `firstboot.sh` und `vb-firstboot.service`
@@ -330,7 +335,7 @@ openssl rand -base64 18
 ### 4.2 Versiegeln ausführen
 
 ```bash
-cd ~/ubuntu-templating
+cd /opt/ubuntu-templating
 sudo ./seal-template.sh
 ```
 
@@ -450,8 +455,8 @@ Ohne diese Parameter trägt die Beschreibung den FQDN, und die VM joint normal.
 Anmelden als `<benutzer>@int.vitabrevis.ch` oder als `localadmin`, dann:
 
 ```bash
-cd ~/ubuntu-templating 2>/dev/null || git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git ~/ubuntu-templating
-sudo ~/ubuntu-templating/post-clone.sh --status
+cd /opt/ubuntu-templating 2>/dev/null || sudo git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git /opt/ubuntu-templating
+sudo /opt/ubuntu-templating/post-clone.sh --status
 ```
 
 Das zeigt Hostname, Firstboot-Marker, Join-Status, SSSD-Status, die Auflösung
@@ -522,7 +527,7 @@ Alle paar Monate, damit neue VMs nicht mit hundert ausstehenden Updates starten.
 
    ```bash
    sudo apt update && sudo apt upgrade -y
-   cd ~/ubuntu-templating && git pull
+   cd /opt/ubuntu-templating && sudo git pull
    ```
 
 4. Bei Änderungen an den Scripts die Vorbereitung erneut laufen lassen,
@@ -683,8 +688,8 @@ oder `domain-join.sh` von Hand gejoint.
 
 ```bash
 # Template bauen
-git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git
-cd ubuntu-templating
+sudo git clone https://github.com/Vita-Brevis-GmbH/ubuntu-templating.git /opt/ubuntu-templating
+cd /opt/ubuntu-templating
 sudo ./prepare-template.sh
 sudo ./seal-template.sh
 sudo shutdown -h now

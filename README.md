@@ -1068,7 +1068,7 @@ Ein Template will regelmässig gepatcht werden. Der Ablauf:
 4. Versiegeln — hier wird auch das Break-Glass-Passwort neu vergeben und die
    Firstboot-Automatik wieder scharf geschaltet:
    ```bash
-   cd ~/ubuntu-templating && git pull
+   cd /opt/ubuntu-templating && sudo git pull
    sudo ./seal-template.sh
    ```
 5. Herunterfahren (**nicht** neu starten) und zurück konvertieren:
