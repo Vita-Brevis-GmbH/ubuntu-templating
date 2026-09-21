@@ -61,22 +61,28 @@ prompt_input() {
     echo "${value:-$default}"
 }
 
+# WICHTIG: Diese Funktion wird via $(...) aufgerufen — stdout ist
+# ausschliesslich fuer das Passwort reserviert. Jede andere Ausgabe muss
+# nach stderr, sonst landet sie mit im Passwort. (Der Prompt von 'read -rsp'
+# geht bereits von sich aus nach stderr.)
 prompt_password() {
     local prompt="$1"
     local pass1 pass2
     read -rsp "  ${prompt}: " pass1
-    echo ""
+    echo "" >&2
     read -rsp "  ${prompt} (bestaetigen): " pass2
-    echo ""
+    echo "" >&2
     if [[ "${pass1}" != "${pass2}" ]]; then
-        echo "  Fehler: Passwoerter stimmen nicht ueberein!"
+        echo "  Fehler: Passwoerter stimmen nicht ueberein!" >&2
         exit 1
     fi
     if [[ -z "${pass1}" ]]; then
-        echo "  Fehler: Passwort darf nicht leer sein!"
+        echo "  Fehler: Passwort darf nicht leer sein!" >&2
         exit 1
     fi
-    echo "${pass1}"
+    # printf statt echo: ein Passwort wie '-n' oder '-e' wuerde von echo
+    # als Option interpretiert und verschluckt werden.
+    printf '%s' "${pass1}"
 }
 
 # ── SSL Setup (idempotent) ─────────────────────────────────────
