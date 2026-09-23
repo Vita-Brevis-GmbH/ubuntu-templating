@@ -166,7 +166,13 @@ cat > /etc/sssd/sssd.conf <<EOF
 [sssd]
 domains = ${AD_DOMAIN}
 config_file_version = 2
-services = nss, pam, sudo
+# Bewusst KEINE 'services'-Zeile. Auf systemd-Systemen ist sie laut
+# sssd.conf(5) optional, weil die Responder per Socket aktiviert werden.
+# Steht ein Responder hier drin, startet der SSSD-Monitor ihn selbst und
+# belegt dessen Socket. Die gleichnamige systemd-Unit scheitert dann in
+# ihrem ExecStartPre (sssd_check_socket_activated_responders) und meldet
+# beim Booten 'Failed to listen on sssd-<name>.socket'. Funktional
+# harmlos, aber es sieht nach einem kaputten Join aus.
 
 [domain/${AD_DOMAIN}]
 default_shell = /bin/bash
@@ -253,7 +259,13 @@ cat > /etc/sssd/sssd.conf <<EOF
 [sssd]
 domains = ${AD_DOMAIN}
 config_file_version = 2
-services = nss, pam, sudo
+# Bewusst KEINE 'services'-Zeile. Auf systemd-Systemen ist sie laut
+# sssd.conf(5) optional, weil die Responder per Socket aktiviert werden.
+# Steht ein Responder hier drin, startet der SSSD-Monitor ihn selbst und
+# belegt dessen Socket. Die gleichnamige systemd-Unit scheitert dann in
+# ihrem ExecStartPre (sssd_check_socket_activated_responders) und meldet
+# beim Booten 'Failed to listen on sssd-<name>.socket'. Funktional
+# harmlos, aber es sieht nach einem kaputten Join aus.
 
 [domain/${AD_DOMAIN}]
 default_shell = /bin/bash

@@ -236,17 +236,46 @@ AllowGroups sudo localadmin G_server-admin@int.vitabrevis.ch
 sudo sshd -t && sudo systemctl try-reload-or-restart ssh
 ```
 
-> **Hinweis:** `try-reload-or-restart` wirkt nur auf eine aktive Unit. Bei
-> socket-aktiviertem sshd ist `ssh.service` inaktiv und der Befehl ein
-> No-op. Das ist richtig so: dort liest jede neue Verbindung die
-> Konfiguration ohnehin frisch ein. Ein `systemctl restart ssh` wäre an
-> dieser Stelle falsch, es würde den Dauer-Daemon neben dem Socket starten.
+> ⚠️ **Eine Konfigurationsänderung braucht ein Reload — auch bei
+> Socket-Aktivierung.** Das wird gern falsch verstanden. `ssh.socket` hat
+> `Accept=no`, systemd bindet also nur den Port und übergibt den lauschenden
+> Socket an **einen** dauerhaft laufenden `sshd -D` aus `ssh.service`. Der
+> liest `sshd_config` genau einmal beim Start. Nur mit `Accept=yes` würde je
+> Verbindung ein eigener Prozess starten und die Konfiguration neu lesen.
+>
+> `try-reload-or-restart` trifft beide Fälle richtig: Läuft der Daemon
+> bereits, bekommt er SIGHUP. Läuft er noch nicht, passiert nichts, und die
+> erste Verbindung startet ihn mit der neuen Konfiguration.
+>
+> Nach einer Änderung an `Port` oder `ListenAddress` reicht das nicht. Dann
+> muss zusätzlich der Socket neu erzeugt werden:
+> ```bash
+> sudo systemctl daemon-reload && sudo systemctl restart ssh.socket
+> ```
 
 > **Hinweis:** `AllowGroups` enthält neben der AD-Gruppe auch `sudo` und
 > `localadmin`. Damit bleibt der Break-Glass-Zugang offen, solange die Domain
 > nicht erreichbar ist. Schlägt `sshd -t` fehl, entfernt
 > `prepare-template.sh` das Drop-in wieder, statt die laufende SSH-Sitzung zu
 > riskieren.
+
+> ⚠️ **Gross- und Kleinschreibung entscheidet hier.** sshd vergleicht
+> Gruppennamen zeichengenau. SSSD ist beim AD-Provider dagegen zwingend
+> case-insensitiv, `case_sensitive = True` ist laut `sssd.conf(5)` für AD
+> sogar ungültig. Namen kommen aus NSS deshalb **kleingeschrieben** zurück,
+> unabhängig davon, wie sie im Verzeichnis stehen.
+>
+> Das Fehlerbild ist tückisch: `getent group G_server-admin@domain` liefert
+> einen Treffer, weil die Suche case-insensitiv ist. `id` zeigt aber
+> `g_server-admin@domain`, und sshd findet keine Übereinstimmung. Es weist
+> ab und ersetzt dabei das eingegebene Passwort durch eine Dummy-Zeichenkette
+> (Schutz vor Timing-Angriffen). Im Log landet dann ein
+> Kerberos-Preauth-Fehler statt einer Zugriffsverweigerung, während `su` und
+> `kinit` mit demselben Passwort einwandfrei funktionieren.
+>
+> `prepare-template.sh` schreibt deshalb die Kleinschreibung, und
+> `vb-firstboot.sh` zieht die Zeile nach dem Join auf den tatsächlich
+> gelieferten Namen nach.
 
 ### Schritt 4b — SSH Host Keys vor sshd regenerieren
 
@@ -417,7 +446,7 @@ sudo vim /etc/sssd/sssd.conf
 [sssd]
 domains = int.vitabrevis.ch
 config_file_version = 2
-services = nss, pam, sudo
+# Bewusst KEINE 'services'-Zeile — siehe Hinweis unten.
 # Hinweis: KEIN 'default_domain_suffix' setzen — es ist laut SSSD-Doku
 # inkompatibel mit sudo und bricht das Matching gruppenbasierter
 # sudoers-Regeln (%G_server-admin@domain) sowie die Namensauflösung der
@@ -447,6 +476,40 @@ dyndns_update = True
 # sssd.conf muss nur für root lesbar sein
 sudo chmod 600 /etc/sssd/sssd.conf
 ```
+
+> **Warum keine `services`-Zeile mehr.** Laut `sssd.conf(5)` ist sie auf
+> systemd-Systemen optional, weil die Responder per Socket aktiviert werden.
+> Steht ein Responder trotzdem darin, startet der SSSD-Monitor ihn selbst und
+> belegt dessen Socket. Die gleichnamige systemd-Unit scheitert dann in ihrem
+> `ExecStartPre` und meldet beim Booten `Failed to listen on
+> sssd-<name>.socket`. Funktional ist das harmlos, die Responder laufen ja.
+> Es sieht beim ersten Boot eines Klons aber aus wie ein kaputter Join, und
+> genau das soll die Konsole nicht zeigen.
+
+### Schritt 8b — Responder-Sockets
+
+Ohne `services`-Zeile kommen die Responder ausschliesslich über
+Socket-Aktivierung hoch. Die Units müssen also aktiviert sein. Die Paketierung
+erledigt das im `postinst`, `prepare-template.sh` setzt es zusätzlich explizit:
+
+```bash
+for s in sssd-nss sssd-pam sssd-sudo sssd-ssh sssd-autofs; do
+    sudo systemctl enable "$s.socket"
+done
+```
+
+Eine Ausnahme gibt es:
+
+```bash
+sudo systemctl disable sssd-pac.socket
+```
+
+> **Warum ausgerechnet dieser Socket.** Sobald eine Domain `id_provider = ad`
+> hat, hängt SSSD den PAC-Responder **implizit** an die Service-Liste an, ganz
+> unabhängig davon, was in der `sssd.conf` steht. Der Monitor startet ihn dann
+> selbst und belegt den Socket, und `sssd-pac.socket` scheitert bei jedem Boot.
+> Abschalten betrifft nur den redundanten Aktivierungsweg. Der PAC-Responder
+> selbst läuft weiter, und er wird auf AD auch gebraucht.
 
 ### Schritt 9 — Automatische Home-Verzeichnisse aktivieren
 ```bash
@@ -1021,6 +1084,8 @@ sudo ./post-clone.sh --password
 | Log: „Domain nicht erreichbar"             | DNS zeigt nicht auf die DCs                  | `nslookup _ldap._tcp.int.vitabrevis.ch`, DNS in der Spec korrigieren |
 | Join-Fehler „Insufficient permissions"     | Join-Account hat zu wenig Delegation         | Rechte auf der Computer-OU prüfen (Part 6c, Schritt 12d)       |
 | Firstboot lief gar nicht                   | Marker war beim Versiegeln noch da           | Im Template `rm /var/lib/vb-template/firstboot.done`, neu versiegeln |
+| Boot zeigt `Failed to listen on sssd-*.socket` | Responder steht in der `services`-Zeile der `sssd.conf` | Zeile entfernen, die Responder kommen per Socket-Aktivierung |
+| Nur `sssd-pac.socket` scheitert | Bei `id_provider = ad` startet der Monitor den PAC-Responder implizit | `systemctl disable sssd-pac.socket`, der Responder läuft weiter |
 | `join.secret` fehlt auf dem Klon           | Normal nach erfolgreichem Join               | Für einen erneuten Join fragt `post-clone.sh --force` das Passwort ab |
 | Kein Auto-Join, obwohl gewünscht           | Beim Bau kein Join-Passwort angegeben        | `ENABLE_JOIN` in `/etc/vb-template/firstboot.conf` prüfen, Secret nachtragen |
 
@@ -1045,6 +1110,8 @@ sudo ./post-clone.sh --password
 | SNMP: `Unknown Object Identifier` | MIB-Dateien fehlen (`snmp-mibs-downloader`) | Numerische OID verwenden, z.B. `.1.3.6.1.2.1.1.1.0` |
 | Sudoers-Änderung greift nicht    | SSSD cached Gruppenmitgliedschaft  | `rm -rf /var/lib/sss/db/*`, SSSD restart, neu einloggen |
 | Login verweigert                 | User nicht in erlaubter Gruppe      | `ad_access_filter` oder `AllowGroups` prüfen    |
+| AD-Login scheitert, `su` und `kinit` gehen | Schreibweise der Gruppe in `AllowGroups` weicht ab | `id <user>@<domain>` zeigt den echten Namen, `AllowGroups` darauf setzen |
+| Log zeigt Kerberos-Preauth-Fehler trotz korrektem Passwort | sshd hat per `AllowGroups` abgelehnt und ein Dummy-Passwort eingesetzt | Nicht Kerberos prüfen, sondern `journalctl -t sshd-session -b` nach `not allowed` durchsuchen |
 | Home-Verzeichnis fehlt           | pam_mkhomedir nicht aktiv           | `pam-auth-update --enable mkhomedir`            |
 | Offline-Login schlägt fehl       | `cache_credentials = False`         | `cache_credentials = True` in sssd.conf setzen  |
 
@@ -1068,7 +1135,7 @@ Ein Template will regelmässig gepatcht werden. Der Ablauf:
 4. Versiegeln — hier wird auch das Break-Glass-Passwort neu vergeben und die
    Firstboot-Automatik wieder scharf geschaltet:
    ```bash
-   cd ~/ubuntu-templating && git pull
+   cd /opt/ubuntu-templating && sudo git pull
    sudo ./seal-template.sh
    ```
 5. Herunterfahren (**nicht** neu starten) und zurück konvertieren:

@@ -40,6 +40,8 @@ SECRET_FILE="${CONF_DIR}/join.secret"
 STATE_DIR="/var/lib/vb-template"
 MARKER="${STATE_DIR}/firstboot.done"
 LOG_FILE="/var/log/vb-firstboot.log"
+SSHD_DROPIN="/etc/ssh/sshd_config.d/99-vita-brevis.conf"
+SUDOERS_FILE="/etc/sudoers.d/ad-admins"
 
 # ── Defaults (werden von firstboot.conf ueberschrieben) ─────────
 AD_DOMAIN=""
@@ -330,7 +332,13 @@ cat > /etc/sssd/sssd.conf <<EOF
 [sssd]
 domains = ${AD_DOMAIN}
 config_file_version = 2
-services = nss, pam, sudo
+# Bewusst KEINE 'services'-Zeile. Auf systemd-Systemen ist sie laut
+# sssd.conf(5) optional, weil die Responder per Socket aktiviert werden.
+# Steht ein Responder hier drin, startet der SSSD-Monitor ihn selbst und
+# belegt dessen Socket. Die gleichnamige systemd-Unit scheitert dann in
+# ihrem ExecStartPre (sssd_check_socket_activated_responders) und meldet
+# beim Booten 'Failed to listen on sssd-<name>.socket'. Funktional
+# harmlos, aber es sieht nach einem kaputten Join aus.
 # Hinweis: KEIN 'default_domain_suffix' setzen — laut SSSD-Doku
 # inkompatibel mit sudo.
 
@@ -352,26 +360,128 @@ EOF
 chmod 600 /etc/sssd/sssd.conf
 
 systemctl enable sssd >/dev/null 2>&1 || warn "'systemctl enable sssd' fehlgeschlagen."
+
+# Ohne 'services'-Zeile in der sssd.conf kommen die Responder
+# ausschliesslich ueber Socket-Aktivierung hoch. Sicherstellen, dass die
+# Units da sind — im Template sind sie aktiviert, aber ein Klon soll
+# sich nicht darauf verlassen muessen.
+for _sock in sssd-nss sssd-pam sssd-sudo; do
+    systemctl enable "${_sock}.socket" >/dev/null 2>&1 || true
+done
+# Siehe prepare-template.sh: dieser eine Socket kollidiert bei
+# 'id_provider = ad' immer mit dem implizit gestarteten PAC-Responder.
+systemctl disable sssd-pac.socket >/dev/null 2>&1 || true
+
 if ! systemctl restart sssd; then
     die "SSSD startet nicht. Pruefen: journalctl -u sssd -n 50"
 fi
 log "        SSSD laeuft und ist aktiviert."
 
+# Fehlgeschlagene sssd-Units melden. Seit die Responder ueber Sockets
+# kommen, ist das kein kosmetisches Detail mehr — scheitert hier eine
+# Unit, funktioniert der zugehoerige Dienst nicht.
+_failed_units="$(systemctl list-units --failed --plain --no-legend --no-pager 2>/dev/null \
+    | awk '$1 ~ /^sssd/ {printf " %s", $1}')"
+if [[ -n "$_failed_units" ]]; then
+    warn "Fehlgeschlagene SSSD-Units:${_failed_units}
+        Pruefen mit: systemctl status <unit>"
+else
+    log "        Keine fehlgeschlagenen SSSD-Units."
+fi
+unset _failed_units
+
 # ── Verifikation (nicht-interaktiv) ─────────────────────────────
 VERIFY_OK="no"
+CANON_GROUP=""
 for _ in {1..12}; do
-    if getent group "${AD_ADMIN_GROUP}@${AD_DOMAIN}" >/dev/null 2>&1; then
+    # Erste Spalte von getent: der Gruppenname in der Schreibweise, die
+    # SSSD tatsaechlich ausliefert.
+    CANON_GROUP="$(getent group "${AD_ADMIN_GROUP}@${AD_DOMAIN}" 2>/dev/null | cut -d: -f1)"
+    if [[ -n "$CANON_GROUP" ]]; then
         VERIFY_OK="yes"
         break
     fi
     sleep 5
 done
 if [[ "$VERIFY_OK" == "yes" ]]; then
-    log "        Verifikation OK — AD-Gruppe '${AD_ADMIN_GROUP}@${AD_DOMAIN}' aufloesbar."
+    log "        Verifikation OK — AD-Gruppe aufloesbar als '${CANON_GROUP}'."
 else
     warn "AD-Gruppe '${AD_ADMIN_GROUP}@${AD_DOMAIN}' nicht aufloesbar.
         Der Join selbst war erfolgreich. Pruefen, ob der Gruppenname stimmt:
         'getent group ${AD_ADMIN_GROUP}@${AD_DOMAIN}' bzw. 'sssctl domain-status ${AD_DOMAIN}'"
+fi
+
+# ── Gruppennamen auf die kanonische Schreibweise ziehen ─────────
+#
+# Warum das noetig ist: sshd vergleicht Gruppennamen in AllowGroups
+# ZEICHENGENAU. SSSD dagegen ist beim AD-Provider zwingend
+# case-insensitiv — 'case_sensitive = True' ist dort laut sssd.conf(5)
+# ungueltig, der Default ist False, und damit kommen Namen aus NSS
+# kleingeschrieben zurueck.
+#
+# Folge ohne diese Korrektur: 'getent group G_Server-Admin@domain'
+# liefert brav einen Treffer, die Verifikation oben meldet OK, und sshd
+# weist denselben Benutzer trotzdem ab, weil in seiner Gruppenliste
+# 'g_server-admin@domain' steht. sshd ersetzt das Passwort dann durch
+# eine Dummy-Zeichenkette (Schutz vor Timing-Angriffen), weshalb im Log
+# ein Kerberos-Preauth-Fehler landet statt einer Zugriffsverweigerung.
+# Das ist ausgesprochen schwer zu deuten.
+#
+# Deshalb: nach dem Join den echten Namen holen und die Konfiguration
+# darauf setzen. Das deckt auch 'case_sensitive = Preserving' ab, wo die
+# Schreibweise aus dem Verzeichnis erhalten bleibt.
+TYPED_GROUP="${AD_ADMIN_GROUP}@${AD_DOMAIN}"
+if [[ "$VERIFY_OK" == "yes" && "$CANON_GROUP" != "$TYPED_GROUP" ]]; then
+    log "        Schreibweise weicht ab: konfiguriert '${TYPED_GROUP}', geliefert '${CANON_GROUP}'."
+
+    # --- sshd ---
+    if [[ -f "$SSHD_DROPIN" ]] && grep -q '^AllowGroups ' "$SSHD_DROPIN"; then
+        _tmp="$(mktemp)"
+        cp "$SSHD_DROPIN" "$_tmp.bak"
+        # Beide Schreibweisen eintragen. Kostet nichts und haelt die
+        # Konfiguration gueltig, falls sich das Verhalten spaeter aendert.
+        sed "s|^AllowGroups .*|AllowGroups sudo ${LOCAL_ADMIN_USER} ${CANON_GROUP} ${TYPED_GROUP}|" \
+            "$SSHD_DROPIN" > "$_tmp"
+        cat "$_tmp" > "$SSHD_DROPIN"
+        if sshd -t 2>/dev/null; then
+            # Ohne Reload bliebe die Korrektur bis zum naechsten Boot
+            # wirkungslos: 'ssh.socket' hat 'Accept=no', systemd uebergibt
+            # den Port also an EINEN dauerhaft laufenden 'sshd -D', und der
+            # liest die Konfiguration nur beim Start.
+            # 'try-reload-or-restart' passt fuer beide Faelle — laeuft der
+            # Daemon noch nicht, startet ihn die erste Verbindung ohnehin
+            # mit der neuen Konfiguration.
+            systemctl try-reload-or-restart ssh >/dev/null 2>&1 || true
+            log "        AllowGroups auf '${CANON_GROUP}' korrigiert, sshd neu geladen."
+        else
+            cat "$_tmp.bak" > "$SSHD_DROPIN"
+            warn "Korrigierte sshd-Konfiguration war ungueltig — Original wiederhergestellt."
+        fi
+        rm -f "$_tmp" "$_tmp.bak"
+    fi
+
+    # --- sudo ---
+    # sudo loest den Gruppennamen ueber NSS auf und ist damit von der
+    # Schreibweise unabhaengig. Der Vollstaendigkeit halber trotzdem
+    # angleichen, aber nur wenn visudo die neue Datei akzeptiert.
+    if [[ -f "$SUDOERS_FILE" ]]; then
+        _sudo_group="${CANON_GROUP// /\\ }"
+        _tmp="$(mktemp)"
+        {
+            echo "# Sudo fuer AD-Gruppe '${AD_ADMIN_GROUP}' erlauben"
+            echo "# Schreibweise von vb-firstboot.sh nach dem Join angeglichen."
+            echo "%${_sudo_group} ALL=(ALL) ALL"
+        } > "$_tmp"
+        chmod 440 "$_tmp"
+        if visudo -c -f "$_tmp" >/dev/null 2>&1; then
+            cat "$_tmp" > "$SUDOERS_FILE"
+            chmod 440 "$SUDOERS_FILE"
+            log "        sudoers-Regel auf '${CANON_GROUP}' korrigiert."
+        else
+            warn "Korrigierte sudoers-Regel war ungueltig — Original bleibt unveraendert."
+        fi
+        rm -f "$_tmp"
+    fi
 fi
 
 # ════════════════════════════════════════════════════════════════

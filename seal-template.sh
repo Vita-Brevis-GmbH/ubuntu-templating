@@ -75,18 +75,7 @@ rm -f /etc/ssh/ssh_host_*
 echo "==> [4/14] Netplan cloud-init Config entfernen (Fallback bleibt erhalten)..."
 rm -f /etc/netplan/50-cloud-init.yaml
 
-echo "==> [5/14] Alle lokalen User ausser '${LOCAL_ADMIN_USER}' entfernen..."
-# Lokale User: UID >= 1000 und < 65534 (nobody). Direkt aus /etc/passwd
-# lesen, damit eventuell gecachte SSSD-Eintraege nicht angefasst werden.
-while IFS=: read -r _user _ _uid _ _ _ _; do
-    if (( _uid >= 1000 && _uid < 65534 )) && [[ "$_user" != "$LOCAL_ADMIN_USER" ]]; then
-        echo "    Entferne User '$_user' (UID $_uid)..."
-        pkill -KILL -u "$_user" 2>/dev/null || true
-        userdel -r -f "$_user" 2>/dev/null || userdel -f "$_user" || true
-    fi
-done < /etc/passwd
-
-echo "==> [6/14] '${LOCAL_ADMIN_USER}' sicherstellen..."
+echo "==> [5/14] '${LOCAL_ADMIN_USER}' sicherstellen..."
 if ! id "$LOCAL_ADMIN_USER" &>/dev/null; then
     adduser --disabled-password --gecos "Local Admin" "$LOCAL_ADMIN_USER"
     echo "    User '$LOCAL_ADMIN_USER' angelegt."
@@ -95,12 +84,55 @@ usermod -aG sudo "$LOCAL_ADMIN_USER"
 # authorized_keys leeren — Test-Keys aus dem Template duerfen nicht in Klone leaken
 rm -f "/home/${LOCAL_ADMIN_USER}/.ssh/authorized_keys"
 
-echo "==> [7/14] '${LOCAL_ADMIN_USER}' Break-Glass-Passwort setzen..."
+echo "==> [6/14] '${LOCAL_ADMIN_USER}' Break-Glass-Passwort setzen..."
+# Bewusst VOR dem Entfernen der uebrigen User: bricht spaeter etwas ab,
+# ist der Notzugang trotzdem gesetzt. Andersherum stuende am Ende ein
+# Template ohne jeden brauchbaren lokalen Login.
+#
 # printf statt echo: keine Backslash-Interpretation, kein "-e"-Problem.
 # chpasswd setzt zugleich das Datum der letzten Aenderung — der
 # Break-Glass-Account startet also ohne erzwungenen Passwortwechsel.
 printf '%s:%s\n' "$LOCAL_ADMIN_USER" "$LOCAL_ADMIN_PASSWORD" | chpasswd
 unset LOCAL_ADMIN_PASSWORD VB_LOCAL_ADMIN_PASSWORD
+
+# Nachsehen, ob wirklich ein Hash in /etc/shadow steht. '!' oder '*'
+# bedeuten gesperrt, leer bedeutet gar kein Passwort — in allen drei
+# Faellen waere der Notzugang wertlos, und das faellt sonst erst beim
+# ersten Ernstfall auf.
+_shadow_hash="$(getent shadow "$LOCAL_ADMIN_USER" | cut -d: -f2)"
+case "${_shadow_hash}" in
+    ''|'!'*|'*')
+        echo "    FEHLER: Fuer '${LOCAL_ADMIN_USER}' steht kein gueltiger" >&2
+        echo "            Passwort-Hash in /etc/shadow (Feld: '${_shadow_hash}')." >&2
+        echo "            Abbruch — ein Template ohne Break-Glass-Zugang ist wertlos." >&2
+        exit 1
+        ;;
+esac
+unset _shadow_hash
+echo "    Passwort gesetzt und in /etc/shadow verifiziert."
+
+echo "==> [7/14] Alle lokalen User ausser '${LOCAL_ADMIN_USER}' entfernen..."
+# Lokale User: UID >= 1000 und < 65534 (nobody). Direkt aus /etc/passwd
+# lesen, damit eventuell gecachte SSSD-Eintraege nicht angefasst werden.
+#
+# Die eigene Sitzung wird NICHT abgeschossen. Wer das Script per sudo aus
+# der Sitzung des Build-Users startet, wuerde sich mit 'pkill -u' sonst
+# selbst rauswerfen: die Login-Shell stirbt, die Sitzung bekommt SIGHUP,
+# und das Script endet mitten im Versiegeln. Ergebnis waere ein Template
+# mit halb geloeschtem Build-User und ohne die restlichen Schritte.
+# 'userdel -f' entfernt das Konto auch bei laufender Sitzung.
+INVOKING_USER="${SUDO_USER:-}"
+[[ -n "$INVOKING_USER" ]] && echo "    Aufrufender User: '${INVOKING_USER}' (Sitzung bleibt am Leben)"
+
+while IFS=: read -r _user _ _uid _ _ _ _; do
+    if (( _uid >= 1000 && _uid < 65534 )) && [[ "$_user" != "$LOCAL_ADMIN_USER" ]]; then
+        echo "    Entferne User '$_user' (UID $_uid)..."
+        if [[ "$_user" != "$INVOKING_USER" ]]; then
+            pkill -KILL -u "$_user" 2>/dev/null || true
+        fi
+        userdel -r -f "$_user" 2>/dev/null || userdel -f "$_user" || true
+    fi
+done < /etc/passwd
 
 echo "==> [8/14] Domain-Mitgliedschaft entfernen (Klon muss neu joinen)..."
 realm leave 2>/dev/null || true
@@ -159,6 +191,42 @@ echo "==> [13/14] SSSD Cache wird bewusst behalten..."
 
 echo "==> [14/14] Abschlusspruefung..."
 SEAL_WARN=0
+
+# Break-Glass-Zugang: Hash vorhanden, Konto nicht gesperrt, kein
+# erzwungener Wechsel. Das ist der Zugang, auf den im Ernstfall alles
+# hinauslaeuft — er wird hier ein zweites Mal geprueft.
+_final_hash="$(getent shadow "$LOCAL_ADMIN_USER" 2>/dev/null | cut -d: -f2)"
+case "${_final_hash}" in
+    ''|'!'*|'*')
+        echo "    FEHLER: '${LOCAL_ADMIN_USER}' hat keinen gueltigen Passwort-Hash."
+        SEAL_WARN=1
+        ;;
+    *)
+        echo "    Break-Glass-Zugang '${LOCAL_ADMIN_USER}': Passwort gesetzt."
+        ;;
+esac
+unset _final_hash
+
+if ! id -nG "$LOCAL_ADMIN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then
+    echo "    WARNUNG: '${LOCAL_ADMIN_USER}' ist nicht in der Gruppe 'sudo'."
+    SEAL_WARN=1
+fi
+
+# Uebrig gebliebene lokale User. Der Build-User von der Installation
+# darf im Template nicht zurueckbleiben.
+_leftover=""
+while IFS=: read -r _u _ _id _ _ _ _; do
+    if (( _id >= 1000 && _id < 65534 )) && [[ "$_u" != "$LOCAL_ADMIN_USER" ]]; then
+        _leftover="${_leftover} ${_u}"
+    fi
+done < /etc/passwd
+if [[ -n "$_leftover" ]]; then
+    echo "    WARNUNG: Diese lokalen User sind noch vorhanden:${_leftover}"
+    echo "             Sie landen unveraendert auf jedem Klon."
+    SEAL_WARN=1
+fi
+unset _leftover
+
 if [[ ! -f /etc/netplan/99-fallback-dhcp.yaml ]]; then
     echo "    WARNUNG: Netplan-Fallback /etc/netplan/99-fallback-dhcp.yaml fehlt."
     SEAL_WARN=1
